@@ -18,21 +18,45 @@
     Workflow,
     X,
   } from '@lucide/svelte';
-  import { formatDistanceToNow } from 'date-fns';
   import { friendlyErrorMessage, getHostOrigin, normalizeRepo, transformHostContext } from './lib/context';
   import {
     eventERefs,
     eventSummary,
     externalUrlForEvent,
     buildRerunDraft,
-    loadWorkers,
-    loadWorkflowRunDetail,
-    loadWorkflowRuns,
     publicLinkForRun,
     statusLabel,
   } from './lib/pipelines';
-  import { connectNip07Signer, submitRerun, toRepoNostrUrl } from './lib/nip07';
-  import { createCashuPaymentToken, loadCashuWalletState } from './lib/wallet';
+  import { connectNip07Signer } from './lib/nip07';
+  import {
+    buildAutoTokenCandidateKey,
+    formatDuration,
+    formatTimeAgo,
+    getStatusBadge,
+    getStatusColor,
+    getStatusIcon,
+    repoName,
+    shortId,
+    suggestedPaymentAmount,
+  } from './lib/presentation';
+  import { buildRunnerScriptTemplate } from './lib/runner-script';
+  import {
+    canGenerateSuggestedToken as canGenerateSuggestedTokenValue,
+    createNewRunDraft,
+    getBestCompatibleMint,
+    getCompatibleMints,
+    getSelectedWorker,
+    getVisibleMintOptions,
+  } from './lib/submission';
+  import RunSubmissionForm from './lib/components/RunSubmissionForm.svelte';
+  import {
+    generatePaymentTokenController,
+    loadRunDetailController,
+    refreshRunsController,
+    refreshWalletController,
+    refreshWorkersController,
+    submitRunController,
+  } from './lib/controllers';
   import type {
     RepoContext,
     RepoContextNormalized,
@@ -74,6 +98,12 @@
   let selectedMint = $state('');
   let paymentAmount = $state(100);
   let generatingPaymentToken = $state(false);
+  let autoTokenPromptOpen = $state(false);
+  let autoTokenPromptKey = $state('');
+  let autoTokenDismissedKey = $state('');
+  let runnerScriptTemplate = $state('');
+  let runnerScriptAutoManaged = $state(true);
+  let rerunCommandMode = $state<'reuse' | 'regenerate'>('reuse');
 
   let searchTerm = $state('');
   let statusFilter = $state<string>('all');
@@ -82,105 +112,31 @@
   let loadSeq = 0;
   let detailSeq = 0;
 
-  function getStatusIcon(status: WorkflowStatus) {
-    switch (status) {
-      case 'success':
-        return Check;
-      case 'failure':
-        return X;
-      case 'running':
-      case 'in_progress':
-        return RotateCw;
-      case 'queued':
-      case 'pending':
-        return Clock;
-      case 'cancelled':
-      case 'skipped':
-      case 'unknown':
-      default:
-        return Circle;
-    }
-  }
+  const selectedWorker = $derived(getSelectedWorker(rerunDraft, discoveredWorkers));
 
-  function getStatusColor(status: WorkflowStatus) {
-    switch (status) {
-      case 'success':
-        return 'text-green-400';
-      case 'failure':
-        return 'text-red-400';
-      case 'running':
-      case 'in_progress':
-        return 'text-yellow-400';
-      case 'queued':
-        return 'text-sky-400';
-      case 'pending':
-        return 'text-zinc-400';
-      default:
-        return 'text-zinc-400';
-    }
-  }
+  const compatibleMints = $derived.by(() => getCompatibleMints(selectedWorker, walletMints));
 
-  function getStatusBadge(status: WorkflowStatus) {
-    switch (status) {
-      case 'success':
-        return 'border-green-500/20 bg-green-500/10 text-green-300';
-      case 'failure':
-        return 'border-red-500/20 bg-red-500/10 text-red-300';
-      case 'running':
-      case 'in_progress':
-        return 'border-yellow-500/20 bg-yellow-500/10 text-yellow-300';
-      case 'queued':
-        return 'border-sky-500/20 bg-sky-500/10 text-sky-300';
-      case 'pending':
-        return 'border-zinc-500/20 bg-zinc-500/10 text-zinc-300';
-      default:
-        return 'border-zinc-500/20 bg-zinc-500/10 text-zinc-300';
-    }
-  }
-
-  function formatTimeAgo(timestamp: number) {
-    return formatDistanceToNow(timestamp, { addSuffix: true });
-  }
-
-  function formatDuration(seconds?: number) {
-    if (!seconds) return '—';
-    if (seconds < 60) return `${seconds}s`;
-
-    const mins = Math.floor(seconds / 60);
-    const secs = seconds % 60;
-    return secs > 0 ? `${mins}m ${secs}s` : `${mins}m`;
-  }
-
-  function shortId(value?: string, size = 8) {
-    return value ? value.slice(0, size) : '—';
-  }
-
-  function repoName(value: RepoContextNormalized | null) {
-    return value?.repoName || 'Loading repository…';
-  }
-
-  const selectedWorker = $derived(
-    rerunDraft?.workerPubkey
-      ? discoveredWorkers.find(worker => worker.pubkey === rerunDraft?.workerPubkey) || null
-      : null
-  );
-
-  const compatibleMints = $derived.by(() => {
-    if (!selectedWorker) return walletMints;
-    const workerMints = selectedWorker.mints || [];
-    return walletMints.filter(mint => workerMints.includes(mint));
-  });
-
-  function suggestedPaymentAmount(worker: LoomWorker | null) {
-    if (!worker?.pricing?.perSecondRate || !worker.minDuration) return 100;
-    return Math.max(1, Math.ceil(worker.pricing.perSecondRate * worker.minDuration));
-  }
+  const visibleMintOptions = $derived(getVisibleMintOptions(compatibleMints, walletMints));
 
   const canGenerateSuggestedToken = $derived(
-    walletAvailable &&
-      !!selectedMint &&
-      paymentAmount > 0 &&
-      (walletBalancesByMint[selectedMint] || 0) >= paymentAmount
+    canGenerateSuggestedTokenValue({
+      walletAvailable,
+      selectedMint,
+      paymentAmount,
+      walletBalancesByMint,
+    })
+  );
+
+  const autoTokenCandidateKey = $derived.by(() =>
+    buildAutoTokenCandidateKey({
+      draft: rerunDraft,
+      selectedWorker,
+      selectedMint,
+      canGenerateSuggestedToken,
+      rerunPaymentToken,
+      submissionMode,
+      paymentAmount,
+    })
   );
 
   async function showToast(message: string, type: 'info' | 'success' | 'warning' | 'error' = 'info') {
@@ -201,7 +157,7 @@
     error = null;
 
     try {
-      workflowRuns = await loadWorkflowRuns(bridge, nextRepo);
+      workflowRuns = await refreshRunsController(bridge, nextRepo)
       if (selectedRunId) {
         const refreshed = workflowRuns.find(run => run.id === selectedRunId);
         if (!refreshed) {
@@ -227,7 +183,7 @@
     detailLoading = true;
 
     try {
-      selectedRunDetail = await loadWorkflowRunDetail(bridge, repo, run.id);
+      selectedRunDetail = await loadRunDetailController(bridge, repo, run.id)
       if (!selectedRunDetail) {
         detailError = 'Run details were not found on the configured relays.';
       }
@@ -249,6 +205,12 @@
     rerunArgsText = '';
     rerunPaymentToken = '';
     rerunSecrets = [{ key: '', value: '' }];
+    rerunCommandMode = 'reuse';
+    runnerScriptTemplate = '';
+    runnerScriptAutoManaged = true;
+    autoTokenPromptOpen = false;
+    autoTokenPromptKey = '';
+    autoTokenDismissedKey = '';
   }
 
   function resetFilters() {
@@ -280,9 +242,10 @@
 
     loadingWorkers = true;
     try {
-      discoveredWorkers = await loadWorkers(bridge, repo);
+      const nextState = await refreshWorkersController(bridge, repo, rerunDraft?.workerPubkey)
+      discoveredWorkers = nextState.workers
       if (rerunDraft && !rerunDraft.workerPubkey) {
-        rerunDraft.workerPubkey = discoveredWorkers[0]?.pubkey || '';
+        rerunDraft.workerPubkey = nextState.nextWorkerPubkey
       }
     } catch (err) {
       signerError = friendlyErrorMessage(err instanceof Error ? err.message : String(err));
@@ -298,15 +261,12 @@
     walletError = null;
 
     try {
-      const state = await loadCashuWalletState(bridge);
-      walletAvailable = true;
-      walletTotalBalance = state.totalBalance;
-      walletBalancesByMint = state.balancesByMint;
-      walletMints = state.mints;
-
-      if (!selectedMint || !state.mints.includes(selectedMint)) {
-        selectedMint = state.mints[0] || '';
-      }
+      const state = await refreshWalletController(bridge, selectedMint)
+      walletAvailable = true
+      walletTotalBalance = state.totalBalance
+      walletBalancesByMint = state.balancesByMint
+      walletMints = state.mints
+      selectedMint = state.nextSelectedMint
     } catch (err) {
       walletAvailable = false;
       walletError = friendlyErrorMessage(err instanceof Error ? err.message : String(err));
@@ -330,21 +290,33 @@
     walletError = null;
 
     try {
-      const token = await createCashuPaymentToken(
+      const token = await generatePaymentTokenController(
         bridge,
         paymentAmount,
         selectedMint,
-        submissionMode === 'new' ? 'CI/CD pipeline runner' : 'CI/CD pipeline rerun'
-      );
+        submissionMode
+      )
       rerunPaymentToken = token;
       await refreshWallet();
       await showToast('Generated Cashu payment token', 'success');
     } catch (err) {
       walletError = friendlyErrorMessage(err instanceof Error ? err.message : String(err));
       await showToast(walletError, 'error');
+      autoTokenDismissedKey = '';
     } finally {
       generatingPaymentToken = false;
     }
+  }
+
+  async function confirmAutoTokenGeneration() {
+    autoTokenPromptOpen = false;
+    autoTokenDismissedKey = autoTokenPromptKey;
+    await generatePaymentToken();
+  }
+
+  function dismissAutoTokenGeneration() {
+    autoTokenPromptOpen = false;
+    autoTokenDismissedKey = autoTokenPromptKey;
   }
 
   $effect(() => {
@@ -355,10 +327,7 @@
   $effect(() => {
     if (!selectedWorker) return;
 
-    const bestCompatibleMint =
-      compatibleMints
-        .slice()
-        .sort((a, b) => (walletBalancesByMint[b] || 0) - (walletBalancesByMint[a] || 0))[0] || '';
+    const bestCompatibleMint = getBestCompatibleMint(compatibleMints, walletBalancesByMint)
 
     if (bestCompatibleMint && selectedMint !== bestCompatibleMint) {
       selectedMint = bestCompatibleMint;
@@ -367,37 +336,59 @@
     const suggested = suggestedPaymentAmount(selectedWorker);
     if (!rerunPaymentToken && paymentAmount <= 0) {
       paymentAmount = suggested;
-    } else if (!rerunPaymentToken && paymentAmount === 100) {
+    } else if (!rerunPaymentToken && paymentAmount === 100 && suggested !== 100) {
       paymentAmount = suggested;
     }
   });
 
+  $effect(() => {
+    const key = autoTokenCandidateKey;
+    if (!key) {
+      autoTokenPromptOpen = false;
+      autoTokenPromptKey = '';
+      return;
+    }
+
+    if (key === autoTokenDismissedKey || generatingPaymentToken) {
+      return;
+    }
+
+    if (key !== autoTokenPromptKey) {
+      autoTokenPromptKey = key;
+      autoTokenPromptOpen = true;
+    }
+  });
+
+  $effect(() => {
+    if (!rerunDraft || !runnerScriptAutoManaged) return;
+    if (submissionMode !== 'new' && !(submissionMode === 'rerun' && rerunCommandMode === 'regenerate')) {
+      return;
+    }
+
+    runnerScriptTemplate = buildRunnerScriptTemplate(
+      rerunDraft.workflowPath,
+      selectedWorker,
+      rerunDraft.branch
+    );
+  });
+
   function openNewRunForm() {
-    if (!repo?.repoNaddr) return;
+    if (!repo) return
 
     selectedRunId = null;
     selectedRunDetail = null;
     detailError = null;
-
-    const publishRelays = Array.from(new Set([...repo.repoRelays, 'wss://relay.sharegap.net', 'wss://nos.lol']));
-    rerunDraft = {
-      repoNaddr: repo.repoNaddr,
-      workflowPath: '',
-      branch: 'main',
-      commit: '',
-      workerPubkey: '',
-      command: 'bash',
-      args: [
-        '-c',
-        'curl -fsSL "https://example.invalid/run-workflow.sh" -o /tmp/run-workflow.sh && chmod +x /tmp/run-workflow.sh && /tmp/run-workflow.sh',
-      ],
-      envVars: [],
-      repoNostrUrl: toRepoNostrUrl(repo.repoNaddr, publishRelays),
-      publishRelays,
-    };
+    rerunDraft = createNewRunDraft(repo);
+    if (!rerunDraft) return
     rerunArgsText = rerunDraft.args.join('\n');
     rerunPaymentToken = '';
     rerunSecrets = [{ key: '', value: '' }];
+    rerunCommandMode = 'reuse';
+    runnerScriptAutoManaged = true;
+    runnerScriptTemplate = buildRunnerScriptTemplate('', null, 'main');
+    autoTokenPromptOpen = false;
+    autoTokenPromptKey = '';
+    autoTokenDismissedKey = '';
     signerError = null;
     submissionMode = 'new';
     void refreshWorkers();
@@ -421,6 +412,16 @@
     rerunArgsText = nextDraft.args.join('\n');
     rerunPaymentToken = '';
     rerunSecrets = [{ key: '', value: '' }];
+    rerunCommandMode = 'reuse';
+    runnerScriptAutoManaged = true;
+    runnerScriptTemplate = buildRunnerScriptTemplate(
+      nextDraft.workflowPath,
+      null,
+      nextDraft.branch
+    );
+    autoTokenPromptOpen = false;
+    autoTokenPromptKey = '';
+    autoTokenDismissedKey = '';
     signerError = null;
     submissionMode = 'rerun';
     void refreshWorkers();
@@ -443,23 +444,25 @@
     signerError = null;
 
     try {
-      rerunDraft.args = rerunArgsText
-        .split('\n')
-        .map(value => value.trim())
-        .filter(Boolean);
-
-      const runId = await submitRerun(
+      const runId = await submitRunController({
         signerPubkey,
+        submissionMode,
+        rerunCommandMode,
         rerunDraft,
-        rerunPaymentToken.trim(),
-        rerunSecrets
-      );
+        rerunArgsText,
+        rerunPaymentToken,
+        runnerScriptTemplate,
+        rerunSecrets,
+      })
 
       rerunDraft = null;
       submissionMode = null;
       rerunArgsText = '';
       rerunPaymentToken = '';
       rerunSecrets = [{ key: '', value: '' }];
+      autoTokenPromptOpen = false;
+      autoTokenPromptKey = '';
+      autoTokenDismissedKey = '';
 
       await showToast(`Rerun submitted: ${runId.slice(0, 8)}`, 'success');
       await refreshRuns(repo);
@@ -767,117 +770,65 @@
             </div>
 
             {#if rerunDraft}
-              <div class="space-y-4 rounded-md border border-border bg-background/60 p-4">
-                <div>
-                  <h4 class="text-sm font-semibold">Manual rerun</h4>
-                  <p class="mt-1 text-xs text-muted-foreground">
-                    This reuses the prior workflow metadata and loom command, but needs a fresh
-                    payment token and any secrets that were previously encrypted.
-                  </p>
-                </div>
-
-                <div class="grid gap-3 sm:grid-cols-2">
-                  <label class="space-y-1 text-sm">
-                    <span class="text-xs text-muted-foreground">Workflow</span>
-                    <input
-                      class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
-                      bind:value={rerunDraft.workflowPath} />
-                  </label>
-                  <label class="space-y-1 text-sm">
-                    <span class="text-xs text-muted-foreground">Worker pubkey</span>
-                    <input
-                      class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
-                      bind:value={rerunDraft.workerPubkey} />
-                  </label>
-                  <label class="space-y-1 text-sm">
-                    <span class="text-xs text-muted-foreground">Branch</span>
-                    <input
-                      class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
-                      bind:value={rerunDraft.branch} />
-                  </label>
-                  <label class="space-y-1 text-sm">
-                    <span class="text-xs text-muted-foreground">Commit</span>
-                    <input
-                      class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
-                      bind:value={rerunDraft.commit} />
-                  </label>
-                </div>
-
-                <label class="block space-y-1 text-sm">
-                  <span class="text-xs text-muted-foreground">Fresh payment token</span>
-                  <textarea
-                    class="min-h-24 w-full rounded-md border border-input bg-background px-3 py-2 text-xs font-mono"
-                    bind:value={rerunPaymentToken}
-                    placeholder="Paste a fresh Cashu token or other worker-compatible payment payload"></textarea>
-                </label>
-
-                <div class="space-y-2">
-                  <div class="flex items-center justify-between">
-                    <span class="text-xs text-muted-foreground">Environment variables</span>
-                  </div>
-                  {#each rerunDraft.envVars as envVar, index (index)}
-                    <div class="grid gap-2 sm:grid-cols-2">
-                      <input
-                        class="rounded-md border border-input bg-background px-3 py-2 text-sm"
-                        bind:value={envVar.key}
-                        placeholder="KEY" />
-                      <input
-                        class="rounded-md border border-input bg-background px-3 py-2 text-sm"
-                        bind:value={envVar.value}
-                        placeholder="value" />
-                    </div>
-                  {/each}
-                </div>
-
-                <div class="space-y-2">
-                  <div class="flex items-center justify-between">
-                    <span class="text-xs text-muted-foreground">Secrets to re-enter</span>
-                    <button class="text-xs text-primary hover:underline" onclick={addRerunSecret}>
-                      Add secret
-                    </button>
-                  </div>
-                  {#each rerunSecrets as secret, index (index)}
-                    <div class="grid gap-2 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]">
-                      <input
-                        class="rounded-md border border-input bg-background px-3 py-2 text-sm"
-                        bind:value={secret.key}
-                        placeholder="SECRET_KEY" />
-                      <input
-                        class="rounded-md border border-input bg-background px-3 py-2 text-sm"
-                        bind:value={secret.value}
-                        placeholder="secret value" />
-                      <button
-                        class="rounded-md border border-input px-3 py-2 text-sm hover:bg-accent"
-                        onclick={() => removeRerunSecret(index)}>
-                        Remove
-                      </button>
-                    </div>
-                  {/each}
-                </div>
-
-                {#if signerError}
-                  <div class="rounded-md border border-red-500/20 bg-red-500/10 p-3 text-xs text-red-200">
-                    {signerError}
-                  </div>
-                {/if}
-
-                <div class="flex flex-wrap items-center gap-2">
-                  <button
-                    class="inline-flex items-center gap-2 rounded-md border border-primary/30 bg-primary/10 px-3 py-2 text-sm hover:bg-primary/20"
-                    onclick={() => void submitRerunRequest()}
-                    disabled={rerunSubmitting}>
-                    <Play class={`h-4 w-4 ${rerunSubmitting ? 'animate-pulse' : ''}`} />
-                    {rerunSubmitting ? 'Submitting…' : 'Submit rerun'}
-                  </button>
-                  {#if !signerPubkey}
-                    <button
-                      class="rounded-md border border-input px-3 py-2 text-sm hover:bg-accent"
-                      onclick={() => void connectSigner()}>
-                      Connect signer first
-                    </button>
-                  {/if}
-                </div>
-              </div>
+              <RunSubmissionForm
+                title="Manual rerun"
+                description="This reuses the prior workflow metadata and loom command, but needs a fresh payment token and any secrets that were previously encrypted."
+                {submissionMode}
+                bind:rerunDraft
+                bind:rerunCommandMode
+                bind:rerunArgsText
+                bind:rerunPaymentToken
+                bind:rerunSecrets
+                bind:selectedMint
+                bind:paymentAmount
+                bind:runnerScriptTemplate
+                bind:runnerScriptAutoManaged
+                {rerunSubmitting}
+                {discoveredWorkers}
+                {loadingWorkers}
+                {walletAvailable}
+                {walletLoading}
+                {walletError}
+                {walletTotalBalance}
+                {walletBalancesByMint}
+                {visibleMintOptions}
+                {generatingPaymentToken}
+                {autoTokenPromptOpen}
+                {selectedWorker}
+                {compatibleMints}
+                {signerError}
+                {canGenerateSuggestedToken}
+                {suggestedPaymentAmount}
+                onRefreshWorkers={() => void refreshWorkers()}
+                onRefreshWallet={() => void refreshWallet()}
+                onGeneratePaymentToken={() => void generatePaymentToken()}
+                onConfirmAutoTokenGeneration={() => void confirmAutoTokenGeneration()}
+                onDismissAutoTokenGeneration={dismissAutoTokenGeneration}
+                onAddRerunSecret={addRerunSecret}
+                onRemoveRerunSecret={removeRerunSecret}
+                onSetRerunCommandMode={mode => {
+                  rerunCommandMode = mode
+                  if (mode === 'reuse') {
+                    runnerScriptAutoManaged = false
+                  } else {
+                    runnerScriptAutoManaged = true
+                    runnerScriptTemplate = buildRunnerScriptTemplate(
+                      rerunDraft.workflowPath,
+                      selectedWorker,
+                      rerunDraft.branch,
+                    )
+                  }
+                }}
+                onRegenerateTemplate={() => {
+                  runnerScriptAutoManaged = true
+                  runnerScriptTemplate = buildRunnerScriptTemplate(
+                    rerunDraft.workflowPath,
+                    selectedWorker,
+                    rerunDraft.branch,
+                  )
+                }}
+                onSubmit={() => void submitRerunRequest()}
+                onConnectSigner={() => void connectSigner()} />
             {/if}
 
             <div class="grid gap-3 sm:grid-cols-2">
@@ -981,175 +932,67 @@
                 </p>
               </div>
 
-              <div class="space-y-4 rounded-md border border-border bg-background/60 p-4">
-                <div class="grid gap-3 sm:grid-cols-2">
-                  <label class="space-y-1 text-sm">
-                    <span class="text-xs text-muted-foreground">Workflow</span>
-                    <input
-                      class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
-                      bind:value={rerunDraft.workflowPath} />
-                  </label>
-                  <label class="space-y-1 text-sm">
-                    <span class="text-xs text-muted-foreground">Branch</span>
-                    <input
-                      class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
-                      bind:value={rerunDraft.branch} />
-                  </label>
-                  <label class="space-y-1 text-sm sm:col-span-2">
-                    <span class="text-xs text-muted-foreground">Commit</span>
-                    <input
-                      class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
-                      bind:value={rerunDraft.commit} />
-                  </label>
-                </div>
-
-                <div class="space-y-2">
-                  <div class="flex items-center justify-between">
-                    <span class="text-xs text-muted-foreground">Worker discovery</span>
-                    <button class="text-xs text-primary hover:underline" onclick={() => void refreshWorkers()}>
-                      {loadingWorkers ? 'Refreshing…' : 'Refresh workers'}
-                    </button>
-                  </div>
-                  {#if discoveredWorkers.length > 0}
-                    <div class="grid gap-2">
-                      {#each discoveredWorkers as worker (worker.pubkey)}
-                        <button
-                          class={`rounded-md border p-3 text-left text-sm ${rerunDraft.workerPubkey === worker.pubkey
-                            ? 'border-primary/40 bg-primary/10'
-                            : 'border-input hover:bg-accent'}`}
-                          onclick={() => (rerunDraft.workerPubkey = worker.pubkey)}>
-                          <div class="flex items-center justify-between gap-3">
-                            <div>
-                              <div class="font-medium">{worker.name}</div>
-                              <div class="mt-1 break-all text-xs text-muted-foreground">
-                                {worker.pubkey}
-                              </div>
-                            </div>
-                            <span class={`h-2.5 w-2.5 rounded-full ${worker.online ? 'bg-green-400' : 'bg-zinc-500'}`}></span>
-                          </div>
-                        </button>
-                      {/each}
-                    </div>
-                  {:else}
-                    <div class="rounded-md border border-input p-3 text-sm text-muted-foreground">
-                      {loadingWorkers ? 'Discovering workers…' : 'No workers discovered yet.'}
-                    </div>
-                  {/if}
-                </div>
-
-                <label class="block space-y-1 text-sm">
-                  <span class="text-xs text-muted-foreground">Command</span>
-                  <input
-                    class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
-                    bind:value={rerunDraft.command} />
-                </label>
-
-                <label class="block space-y-1 text-sm">
-                  <span class="text-xs text-muted-foreground">Arguments (one per line)</span>
-                  <textarea
-                    class="min-h-24 w-full rounded-md border border-input bg-background px-3 py-2 text-xs font-mono"
-                    bind:value={rerunArgsText}></textarea>
-                </label>
-
-                <label class="block space-y-1 text-sm">
-                  <span class="text-xs text-muted-foreground">Fresh payment token</span>
-                  <div class="grid gap-2 rounded-md border border-dashed border-border p-3 sm:grid-cols-[minmax(0,1fr)_auto_auto] sm:items-end">
-                    <label class="space-y-1 text-sm">
-                      <span class="text-xs text-muted-foreground">Mint</span>
-                      <select
-                        class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
-                        bind:value={selectedMint}
-                        disabled={!walletAvailable || walletLoading}>
-                        <option value="">Select a mint</option>
-                        {#each walletMints as mint}
-                          <option value={mint}>
-                            {mint} ({(walletBalancesByMint[mint] || 0).toLocaleString()} sats)
-                          </option>
-                        {/each}
-                      </select>
-                    </label>
-                    <label class="space-y-1 text-sm">
-                      <span class="text-xs text-muted-foreground">Amount</span>
-                      <input
-                        class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
-                        type="number"
-                        min="1"
-                        bind:value={paymentAmount} />
-                    </label>
-                    <div class="flex flex-wrap gap-2">
-                      <button
-                        class="rounded-md border border-input px-3 py-2 text-sm hover:bg-accent"
-                        onclick={() => void refreshWallet()}>
-                        {walletLoading ? 'Loading…' : 'Refresh wallet'}
-                      </button>
-                      <button
-                        class="rounded-md border border-primary/30 bg-primary/10 px-3 py-2 text-sm hover:bg-primary/20"
-                        onclick={() => void generatePaymentToken()}
-                        disabled={!walletAvailable || generatingPaymentToken}>
-                        {generatingPaymentToken ? 'Generating…' : 'Generate token'}
-                      </button>
-                    </div>
-                  </div>
-                  <div class="text-xs text-muted-foreground">
-                    {#if walletAvailable}
-                      Wallet available. Total balance: {walletTotalBalance.toLocaleString()} sats.
-                      {#if selectedWorker}
-                        Compatible mints: {compatibleMints.length > 0
-                          ? compatibleMints.join(', ')
-                          : 'none from current wallet'}.
-                        Suggested amount: {suggestedPaymentAmount(selectedWorker)} sats.
-                      {/if}
-                    {:else if walletError}
-                      Wallet bridge unavailable: {walletError}
-                    {:else}
-                      Wallet bridge not yet checked.
-                    {/if}
-                  </div>
-                  {#if walletAvailable}
-                    <div class="flex flex-wrap items-center gap-2 text-xs">
-                      <button
-                        class="rounded-md border border-input px-2 py-1 hover:bg-accent disabled:opacity-50"
-                        onclick={() => void generatePaymentToken()}
-                        disabled={!canGenerateSuggestedToken || generatingPaymentToken}>
-                        Generate suggested token
-                      </button>
-                      {#if selectedMint}
-                        <span class="text-muted-foreground">
-                          Selected mint balance: {(walletBalancesByMint[selectedMint] || 0).toLocaleString()} sats
-                        </span>
-                      {/if}
-                    </div>
-                  {/if}
-                  <textarea
-                    class="min-h-24 w-full rounded-md border border-input bg-background px-3 py-2 text-xs font-mono"
-                    bind:value={rerunPaymentToken}
-                    placeholder="Paste a fresh Cashu token or other worker-compatible payment payload"></textarea>
-                </label>
-
-                {#if signerError}
-                  <div class="rounded-md border border-red-500/20 bg-red-500/10 p-3 text-xs text-red-200">
-                    {signerError}
-                  </div>
-                {/if}
-
-                <div class="flex flex-wrap items-center gap-2">
-                  <button
-                    class="inline-flex items-center gap-2 rounded-md border border-primary/30 bg-primary/10 px-3 py-2 text-sm hover:bg-primary/20"
-                    onclick={() => void submitRerunRequest()}
-                    disabled={rerunSubmitting}>
-                    <Play class={`h-4 w-4 ${rerunSubmitting ? 'animate-pulse' : ''}`} />
-                    {rerunSubmitting ? 'Submitting…' : 'Submit run'}
-                  </button>
-                  <button
-                    class="rounded-md border border-input px-3 py-2 text-sm hover:bg-accent"
-                    onclick={() => {
-                      rerunDraft = null;
-                      submissionMode = null;
-                    }}>
-                    Cancel
-                  </button>
-                </div>
-              </div>
+              <RunSubmissionForm
+                title={submissionMode === 'new' ? 'New workflow run' : 'Manual rerun'}
+                description={submissionMode === 'new'
+                  ? 'Create a new Hive CI run directly from the widget.'
+                  : 'Reuse a prior run with a fresh payment token and secrets.'}
+                {submissionMode}
+                bind:rerunDraft
+                bind:rerunCommandMode
+                bind:rerunArgsText
+                bind:rerunPaymentToken
+                bind:rerunSecrets
+                bind:selectedMint
+                bind:paymentAmount
+                bind:runnerScriptTemplate
+                bind:runnerScriptAutoManaged
+                {rerunSubmitting}
+                {discoveredWorkers}
+                {loadingWorkers}
+                {walletAvailable}
+                {walletLoading}
+                {walletError}
+                {walletTotalBalance}
+                {walletBalancesByMint}
+                {visibleMintOptions}
+                {generatingPaymentToken}
+                {autoTokenPromptOpen}
+                {selectedWorker}
+                {compatibleMints}
+                {signerError}
+                {canGenerateSuggestedToken}
+                {suggestedPaymentAmount}
+                onRefreshWorkers={() => void refreshWorkers()}
+                onRefreshWallet={() => void refreshWallet()}
+                onGeneratePaymentToken={() => void generatePaymentToken()}
+                onConfirmAutoTokenGeneration={() => void confirmAutoTokenGeneration()}
+                onDismissAutoTokenGeneration={dismissAutoTokenGeneration}
+                onAddRerunSecret={addRerunSecret}
+                onRemoveRerunSecret={removeRerunSecret}
+                onSetRerunCommandMode={mode => {
+                  rerunCommandMode = mode
+                  if (mode === 'reuse') {
+                    runnerScriptAutoManaged = false
+                  } else {
+                    runnerScriptAutoManaged = true
+                    runnerScriptTemplate = buildRunnerScriptTemplate(
+                      rerunDraft.workflowPath,
+                      selectedWorker,
+                      rerunDraft.branch,
+                    )
+                  }
+                }}
+                onRegenerateTemplate={() => {
+                  runnerScriptAutoManaged = true
+                  runnerScriptTemplate = buildRunnerScriptTemplate(
+                    rerunDraft.workflowPath,
+                    selectedWorker,
+                    rerunDraft.branch,
+                  )
+                }}
+                onSubmit={() => void submitRerunRequest()}
+                onConnectSigner={() => void connectSigner()} />
             </div>
           {:else}
             <div class="flex min-h-[320px] flex-col items-center justify-center text-center text-muted-foreground">
