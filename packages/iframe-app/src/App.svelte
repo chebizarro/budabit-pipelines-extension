@@ -176,6 +176,13 @@
     return Math.max(1, Math.ceil(worker.pricing.perSecondRate * worker.minDuration));
   }
 
+  const canGenerateSuggestedToken = $derived(
+    walletAvailable &&
+      !!selectedMint &&
+      paymentAmount > 0 &&
+      (walletBalancesByMint[selectedMint] || 0) >= paymentAmount
+  );
+
   async function showToast(message: string, type: 'info' | 'success' | 'warning' | 'error' = 'info') {
     if (!bridge) return;
 
@@ -339,6 +346,11 @@
       generatingPaymentToken = false;
     }
   }
+
+  $effect(() => {
+    if (!bridge) return;
+    void refreshWallet();
+  });
 
   $effect(() => {
     if (!selectedWorker) return;
@@ -1093,6 +1105,21 @@
                       Wallet bridge not yet checked.
                     {/if}
                   </div>
+                  {#if walletAvailable}
+                    <div class="flex flex-wrap items-center gap-2 text-xs">
+                      <button
+                        class="rounded-md border border-input px-2 py-1 hover:bg-accent disabled:opacity-50"
+                        onclick={() => void generatePaymentToken()}
+                        disabled={!canGenerateSuggestedToken || generatingPaymentToken}>
+                        Generate suggested token
+                      </button>
+                      {#if selectedMint}
+                        <span class="text-muted-foreground">
+                          Selected mint balance: {(walletBalancesByMint[selectedMint] || 0).toLocaleString()} sats
+                        </span>
+                      {/if}
+                    </div>
+                  {/if}
                   <textarea
                     class="min-h-24 w-full rounded-md border border-input bg-background px-3 py-2 text-xs font-mono"
                     bind:value={rerunPaymentToken}
