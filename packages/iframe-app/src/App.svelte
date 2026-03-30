@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { createWidgetBridge, type WidgetBridge } from '@flotilla/ext-shared';
+  import type { WidgetBridge } from '@flotilla/ext-shared';
   import {
     AlertCircle,
     ArrowLeft,
@@ -18,12 +18,11 @@
     Workflow,
     X,
   } from '@lucide/svelte';
-  import { friendlyErrorMessage, getHostOrigin, normalizeRepo, transformHostContext } from './lib/context';
+  import { friendlyErrorMessage, normalizeRepo } from './lib/context';
   import {
     eventERefs,
     eventSummary,
     externalUrlForEvent,
-    buildRerunDraft,
     publicLinkForRun,
     statusLabel,
   } from './lib/pipelines';
@@ -39,24 +38,34 @@
     shortId,
     suggestedPaymentAmount,
   } from './lib/presentation';
-  import { buildRunnerScriptTemplate } from './lib/runner-script';
+  import { reconcileAutoTokenPrompt, reconcileWalletSelection } from './lib/wallet-prompt';
   import {
     canGenerateSuggestedToken as canGenerateSuggestedTokenValue,
-    createNewRunDraft,
-    getBestCompatibleMint,
     getCompatibleMints,
     getSelectedWorker,
     getVisibleMintOptions,
   } from './lib/submission';
   import RunSubmissionForm from './lib/components/RunSubmissionForm.svelte';
+  import { loadRunDetailController, refreshRunsController } from './lib/controllers';
   import {
-    generatePaymentTokenController,
-    loadRunDetailController,
-    refreshRunsController,
-    refreshWalletController,
-    refreshWorkersController,
-    submitRunController,
-  } from './lib/controllers';
+    createSubmissionResetState,
+    prepareNewRunSubmissionState,
+    prepareRerunSubmissionState,
+  } from './lib/submission-state';
+  import {
+    createClosedDetailSessionState,
+    createDetailSessionErrorState,
+    createOpenedDetailSessionState,
+    createOpeningDetailSessionState,
+    reconcileSelectedRunState,
+  } from './lib/detail-session';
+  import { setupWidgetLifecycle } from './lib/widget-lifecycle';
+  import {
+    generatePaymentTokenViewModel,
+    refreshWalletViewModel,
+    refreshWorkersViewModel,
+    submitRunViewModel,
+  } from './lib/view-model';
   import type {
     RepoContext,
     RepoContextNormalized,
@@ -149,6 +158,13 @@
     }
   }
 
+  function applyDetailSessionState(nextState: ReturnType<typeof createClosedDetailSessionState>) {
+    selectedRunId = nextState.selectedRunId
+    selectedRunDetail = nextState.selectedRunDetail
+    detailError = nextState.detailError
+    detailLoading = nextState.detailLoading
+  }
+
   async function refreshRuns(nextRepo: RepoContextNormalized | null = repo) {
     if (!bridge || !nextRepo) return;
 
@@ -158,13 +174,14 @@
 
     try {
       workflowRuns = await refreshRunsController(bridge, nextRepo)
-      if (selectedRunId) {
-        const refreshed = workflowRuns.find(run => run.id === selectedRunId);
-        if (!refreshed) {
-          selectedRunId = null;
-          selectedRunDetail = null;
-        }
-      }
+      if (seq !== loadSeq) return;
+      const nextSelection = reconcileSelectedRunState({
+        workflowRuns,
+        selectedRunId,
+        selectedRunDetail,
+      })
+      selectedRunId = nextSelection.selectedRunId
+      selectedRunDetail = nextSelection.selectedRunDetail
     } catch (err) {
       if (seq !== loadSeq) return;
       error = friendlyErrorMessage(err instanceof Error ? err.message : String(err));
@@ -177,40 +194,66 @@
     if (!bridge || !repo) return;
 
     const seq = ++detailSeq;
-    selectedRunId = run.id;
-    selectedRunDetail = null;
-    detailError = null;
-    detailLoading = true;
+    applyDetailSessionState(createOpeningDetailSessionState(run))
 
     try {
-      selectedRunDetail = await loadRunDetailController(bridge, repo, run.id)
-      if (!selectedRunDetail) {
-        detailError = 'Run details were not found on the configured relays.';
-      }
+      const detail = await loadRunDetailController(bridge, repo, run.id)
+      if (seq !== detailSeq) return
+      applyDetailSessionState(createOpenedDetailSessionState(detail))
     } catch (err) {
       if (seq !== detailSeq) return;
-      detailError = friendlyErrorMessage(err instanceof Error ? err.message : String(err));
-    } finally {
-      if (seq === detailSeq) detailLoading = false;
+      applyDetailSessionState(
+        createDetailSessionErrorState(
+          run.id,
+          friendlyErrorMessage(err instanceof Error ? err.message : String(err))
+        )
+      )
     }
   }
 
+  function applySubmissionState(nextState: ReturnType<typeof createSubmissionResetState>) {
+    rerunDraft = nextState.rerunDraft
+    submissionMode = nextState.submissionMode
+    rerunArgsText = nextState.rerunArgsText
+    rerunPaymentToken = nextState.rerunPaymentToken
+    rerunSecrets = nextState.rerunSecrets
+    rerunCommandMode = nextState.rerunCommandMode
+    runnerScriptTemplate = nextState.runnerScriptTemplate
+    runnerScriptAutoManaged = nextState.runnerScriptAutoManaged
+    autoTokenPromptOpen = nextState.autoTokenPromptOpen
+    autoTokenPromptKey = nextState.autoTokenPromptKey
+    autoTokenDismissedKey = nextState.autoTokenDismissedKey
+  }
+
+  function applySubmissionReset() {
+    applySubmissionState(createSubmissionResetState())
+  }
+
+  function applyWalletState(nextState: {
+    walletAvailable: boolean
+    walletTotalBalance: number
+    walletBalancesByMint: Record<string, number>
+    walletMints: string[]
+    selectedMint: string
+  }) {
+    walletAvailable = nextState.walletAvailable
+    walletTotalBalance = nextState.walletTotalBalance
+    walletBalancesByMint = nextState.walletBalancesByMint
+    walletMints = nextState.walletMints
+    selectedMint = nextState.selectedMint
+  }
+
+  function applyAutoTokenPromptState(nextState: {
+    autoTokenPromptOpen: boolean
+    autoTokenPromptKey: string
+  }) {
+    autoTokenPromptOpen = nextState.autoTokenPromptOpen
+    autoTokenPromptKey = nextState.autoTokenPromptKey
+  }
+
   function closeRun() {
-    selectedRunId = null;
-    selectedRunDetail = null;
-    detailError = null;
-    detailLoading = false;
-    rerunDraft = null;
-    submissionMode = null;
-    rerunArgsText = '';
-    rerunPaymentToken = '';
-    rerunSecrets = [{ key: '', value: '' }];
-    rerunCommandMode = 'reuse';
-    runnerScriptTemplate = '';
-    runnerScriptAutoManaged = true;
-    autoTokenPromptOpen = false;
-    autoTokenPromptKey = '';
-    autoTokenDismissedKey = '';
+    applyDetailSessionState(createClosedDetailSessionState())
+    applySubmissionReset()
   }
 
   function resetFilters() {
@@ -242,11 +285,13 @@
 
     loadingWorkers = true;
     try {
-      const nextState = await refreshWorkersController(bridge, repo, rerunDraft?.workerPubkey)
-      discoveredWorkers = nextState.workers
-      if (rerunDraft && !rerunDraft.workerPubkey) {
-        rerunDraft.workerPubkey = nextState.nextWorkerPubkey
-      }
+      const nextState = await refreshWorkersViewModel({
+        bridge,
+        repo,
+        rerunDraft,
+      })
+      discoveredWorkers = nextState.discoveredWorkers
+      rerunDraft = nextState.rerunDraft
     } catch (err) {
       signerError = friendlyErrorMessage(err instanceof Error ? err.message : String(err));
     } finally {
@@ -261,12 +306,11 @@
     walletError = null;
 
     try {
-      const state = await refreshWalletController(bridge, selectedMint)
-      walletAvailable = true
-      walletTotalBalance = state.totalBalance
-      walletBalancesByMint = state.balancesByMint
-      walletMints = state.mints
-      selectedMint = state.nextSelectedMint
+      const nextState = await refreshWalletViewModel({
+        bridge,
+        selectedMint,
+      })
+      applyWalletState(nextState)
     } catch (err) {
       walletAvailable = false;
       walletError = friendlyErrorMessage(err instanceof Error ? err.message : String(err));
@@ -277,27 +321,19 @@
 
   async function generatePaymentToken() {
     if (!bridge) return;
-    if (!selectedMint) {
-      walletError = 'Select a mint first.';
-      return;
-    }
-    if (paymentAmount <= 0) {
-      walletError = 'Payment amount must be greater than zero.';
-      return;
-    }
 
     generatingPaymentToken = true;
     walletError = null;
 
     try {
-      const token = await generatePaymentTokenController(
+      const nextState = await generatePaymentTokenViewModel({
         bridge,
         paymentAmount,
         selectedMint,
-        submissionMode
-      )
-      rerunPaymentToken = token;
-      await refreshWallet();
+        submissionMode,
+      })
+      rerunPaymentToken = nextState.rerunPaymentToken
+      applyWalletState(nextState)
       await showToast('Generated Cashu payment token', 'success');
     } catch (err) {
       walletError = friendlyErrorMessage(err instanceof Error ? err.message : String(err));
@@ -325,37 +361,37 @@
   });
 
   $effect(() => {
-    if (!selectedWorker) return;
+    const nextState = reconcileWalletSelection({
+      selectedWorker,
+      compatibleMints,
+      walletBalancesByMint,
+      selectedMint,
+      rerunPaymentToken,
+      paymentAmount,
+    })
 
-    const bestCompatibleMint = getBestCompatibleMint(compatibleMints, walletBalancesByMint)
-
-    if (bestCompatibleMint && selectedMint !== bestCompatibleMint) {
-      selectedMint = bestCompatibleMint;
+    if (nextState.selectedMint !== selectedMint) {
+      selectedMint = nextState.selectedMint
     }
 
-    const suggested = suggestedPaymentAmount(selectedWorker);
-    if (!rerunPaymentToken && paymentAmount <= 0) {
-      paymentAmount = suggested;
-    } else if (!rerunPaymentToken && paymentAmount === 100 && suggested !== 100) {
-      paymentAmount = suggested;
+    if (nextState.paymentAmount !== paymentAmount) {
+      paymentAmount = nextState.paymentAmount
     }
   });
 
   $effect(() => {
-    const key = autoTokenCandidateKey;
-    if (!key) {
-      autoTokenPromptOpen = false;
-      autoTokenPromptKey = '';
-      return;
-    }
+    const nextState = reconcileAutoTokenPrompt({
+      autoTokenCandidateKey,
+      autoTokenPromptKey,
+      autoTokenDismissedKey,
+      generatingPaymentToken,
+    })
 
-    if (key === autoTokenDismissedKey || generatingPaymentToken) {
-      return;
-    }
-
-    if (key !== autoTokenPromptKey) {
-      autoTokenPromptKey = key;
-      autoTokenPromptOpen = true;
+    if (
+      nextState.autoTokenPromptOpen !== autoTokenPromptOpen ||
+      nextState.autoTokenPromptKey !== autoTokenPromptKey
+    ) {
+      applyAutoTokenPromptState(nextState)
     }
   });
 
@@ -375,22 +411,12 @@
   function openNewRunForm() {
     if (!repo) return
 
-    selectedRunId = null;
-    selectedRunDetail = null;
-    detailError = null;
-    rerunDraft = createNewRunDraft(repo);
-    if (!rerunDraft) return
-    rerunArgsText = rerunDraft.args.join('\n');
-    rerunPaymentToken = '';
-    rerunSecrets = [{ key: '', value: '' }];
-    rerunCommandMode = 'reuse';
-    runnerScriptAutoManaged = true;
-    runnerScriptTemplate = buildRunnerScriptTemplate('', null, 'main');
-    autoTokenPromptOpen = false;
-    autoTokenPromptKey = '';
-    autoTokenDismissedKey = '';
-    signerError = null;
-    submissionMode = 'new';
+    const nextState = prepareNewRunSubmissionState(repo)
+    if (!nextState) return
+
+    applyDetailSessionState(createClosedDetailSessionState())
+    signerError = null
+    applySubmissionState(nextState)
     void refreshWorkers();
     void refreshWallet();
   }
@@ -398,32 +424,19 @@
   function openRerunForm() {
     if (!repo || !selectedRunDetail) return;
 
-    const nextDraft = buildRerunDraft(repo, selectedRunDetail);
-    if (!nextDraft) {
+    const nextState = prepareRerunSubmissionState({
+      repo,
+      runDetail: selectedRunDetail,
+    })
+
+    if (!nextState) {
       signerError =
         'This run does not include enough loom job metadata to prepare a rerun inside the widget.';
       return;
     }
 
-    rerunDraft = {
-      ...nextDraft,
-      envVars: nextDraft.envVars.map(entry => ({ ...entry })),
-    };
-    rerunArgsText = nextDraft.args.join('\n');
-    rerunPaymentToken = '';
-    rerunSecrets = [{ key: '', value: '' }];
-    rerunCommandMode = 'reuse';
-    runnerScriptAutoManaged = true;
-    runnerScriptTemplate = buildRunnerScriptTemplate(
-      nextDraft.workflowPath,
-      null,
-      nextDraft.branch
-    );
-    autoTokenPromptOpen = false;
-    autoTokenPromptKey = '';
-    autoTokenDismissedKey = '';
     signerError = null;
-    submissionMode = 'rerun';
+    applySubmissionState(nextState)
     void refreshWorkers();
     void refreshWallet();
   }
@@ -434,9 +447,8 @@
       if (!signerPubkey) return;
     }
 
-    if (!rerunDraft) return;
-    if (!rerunPaymentToken.trim()) {
-      signerError = 'A fresh payment token is required for reruns.';
+    if (!bridge || !repo || !rerunDraft) {
+      signerError = 'Missing required context to submit run. Please try refreshing the page.';
       return;
     }
 
@@ -444,7 +456,9 @@
     signerError = null;
 
     try {
-      const runId = await submitRunController({
+      const nextState = await submitRunViewModel({
+        bridge,
+        repo,
         signerPubkey,
         submissionMode,
         rerunCommandMode,
@@ -455,21 +469,11 @@
         rerunSecrets,
       })
 
-      rerunDraft = null;
-      submissionMode = null;
-      rerunArgsText = '';
-      rerunPaymentToken = '';
-      rerunSecrets = [{ key: '', value: '' }];
-      autoTokenPromptOpen = false;
-      autoTokenPromptKey = '';
-      autoTokenDismissedKey = '';
+      applySubmissionReset()
+      workflowRuns = nextState.workflowRuns
+      applyDetailSessionState(nextState.detailSessionState)
 
-      await showToast(`Rerun submitted: ${runId.slice(0, 8)}`, 'success');
-      await refreshRuns(repo);
-      const newRun = workflowRuns.find(run => run.id === runId);
-      if (newRun) {
-        await openRun(newRun);
-      }
+      await showToast(`Rerun submitted: ${nextState.runId.slice(0, 8)}`, 'success');
     } catch (err) {
       signerError = friendlyErrorMessage(err instanceof Error ? err.message : String(err));
       await showToast(signerError, 'error');
@@ -493,56 +497,24 @@
   });
 
   $effect(() => {
-    const b = createWidgetBridge({
-      targetWindow: window.parent,
-      targetOrigin: getHostOrigin(),
-      timeoutMs: 0,
-    });
-
-    bridge = b;
-
-    const offInit = b.onEvent('widget:init', (payload: any) => {
-      if (payload?.repoContext) {
-        const nextRepoCtx = transformHostContext(payload.repoContext);
-        repoCtx = nextRepoCtx;
-        void refreshRuns(normalizeRepo(nextRepoCtx));
-      }
-    });
-
-    const offMounted = b.onEvent('widget:mounted', () => {
-      void refreshRuns();
-    });
-
-    const offUnmounting = b.onEvent('widget:unmounting', () => {
-      loadSeq += 1;
-      detailSeq += 1;
-      workflowRuns = [];
-      closeRun();
-    });
-
-    const offContext = b.onEvent('context:update', (ctx: any) => {
-      const nextRepoCtx = ctx ? transformHostContext(ctx) : null;
-      repoCtx = nextRepoCtx;
-      closeRun();
-      void refreshRuns(normalizeRepo(nextRepoCtx));
-    });
-
-    const offRepoUpdate = b.onEvent('context:repoUpdate', (ctx: any) => {
-      const nextRepoCtx = transformHostContext(ctx);
-      repoCtx = nextRepoCtx;
-      closeRun();
-      void refreshRuns(normalizeRepo(nextRepoCtx));
-    });
-
-    return () => {
-      offInit();
-      offMounted();
-      offUnmounting();
-      offContext();
-      offRepoUpdate();
-      b.destroy();
-      bridge = null;
-    };
+    return setupWidgetLifecycle({
+      onBridgeChange: nextBridge => {
+        bridge = nextBridge
+      },
+      onRepoContextChange: nextRepoCtx => {
+        repoCtx = nextRepoCtx
+      },
+      onRefreshRuns: nextRepo => refreshRuns(nextRepo ?? repo),
+      onRepoChange: () => {
+        closeRun()
+      },
+      onUnmount: () => {
+        loadSeq += 1
+        detailSeq += 1
+        workflowRuns = []
+        closeRun()
+      },
+    })
   });
 </script>
 
