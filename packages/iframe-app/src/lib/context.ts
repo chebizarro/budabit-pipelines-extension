@@ -3,7 +3,7 @@ import type { RepoContext, RepoContextNormalized } from './types';
 export function transformHostContext(hostCtx: any): RepoContext {
   const repo = hostCtx?.repo || hostCtx;
 
-  return {
+  const result: RepoContext = {
     contextId: hostCtx?.contextId,
     userPubkey: hostCtx?.userPubkey,
     relays: hostCtx?.relays || repo?.relays || repo?.repoRelays || [],
@@ -17,6 +17,16 @@ export function transformHostContext(hostCtx: any): RepoContext {
         }
       : undefined,
   };
+
+  console.log('[pipelines] transformHostContext:', {
+    inputKeys: Object.keys(hostCtx || {}),
+    repoPubkey: result.repo?.repoPubkey?.slice(0, 12),
+    repoName: result.repo?.repoName,
+    repoNaddr: result.repo?.repoNaddr?.slice(0, 30),
+    relayCount: result.repo?.repoRelays?.length,
+  });
+
+  return result;
 }
 
 export function normalizeRepo(ctx: RepoContext | null): RepoContextNormalized | null {

@@ -1,40 +1,144 @@
 # Budabit CI/CD Pipelines Extension
 
-A Flotilla Smart Widget extension for viewing and managing CI/CD pipeline runs for your repository.
+A Flotilla Smart Widget extension that provides a full CI/CD pipeline management interface for Nostr-native Git repositories. Users can view workflow run history, inspect live job status, and trigger new runs — all powered by Nostr events and the Loom compute protocol.
 
-This extension provides a comprehensive CI/CD pipeline management interface for Flotilla repositories:
+## How It Works
 
-- **View workflow runs** - Browse all pipeline executions with status indicators
-- **Search and filter** - Find specific runs by name, status, or commit
-- **Real-time updates** - Fetches pipeline runs from Nostr relays (kind 5100 events)
-- **Repository integration** - Automatically loads runs for the current repository context
+### Nostr Event Architecture
 
-Built as a **Smart Widget (kind 30033)** using:
-- Svelte 5 iframe-based UI
-- Widget bridge API for host communication
-- Nostr event queries via `nostr:query` bridge action
-- Tailwind CSS for styling
+The pipelines extension is built entirely on Nostr events. There is no central CI server — workflow runs are represented as a chain of signed Nostr events published to relays, and remote workers pick up jobs via those same relays.
 
-## What is a Smart Widget?
+```
+┌─────────────────────┐       ┌─────────────────┐       ┌─────────────────┐
+│  User (Flotilla)    │       │  Nostr Relays    │       │  Loom Worker    │
+│                     │       │                  │       │                 │
+│  1. Create kind     │──────▶│  5401 run event  │──────▶│  Picks up job   │
+│     5401 run event  │       │  5100 job event  │       │  Clones repo    │
+│  2. Create kind     │──────▶│                  │       │  Runs `act`     │
+│     5100 loom job   │       │                  │       │                 │
+│                     │       │  ◀──────────────────────│  3. Publishes:  │
+│  4. Sees updates    │◀──────│  30100 status    │       │     30100 status│
+│     in real time    │       │  5402 wf result  │       │     5402 result │
+│     via WebSocket   │       │  5101 loom result│       │     5101 result │
+└─────────────────────┘       └─────────────────┘       └─────────────────┘
+```
 
-A Flotilla Smart Widget is represented on Nostr as a **kind `30033` addressable event**. The event describes:
+### Event Kinds
 
-- The widget identifier (`d` tag)
-- Widget type (`l` tag): `action` or `tool`
-- Display metadata (`image`, `icon`)
-- A launch button that points to your hosted iframe app (`button ... app ...`)
-- Declared permissions (`permission` tags)
+| Kind | Name | Direction | Purpose |
+|------|------|-----------|---------|
+| **5401** | Workflow Run | User → Relay | Declares a new CI run. Contains repo address (`#a`), workflow path, branch, commit, and triggering pubkey. |
+| **5100** | Loom Job | User → Relay → Worker | Dispatches a compute job to a specific worker. References the 5401 run via `#e` tag. Contains the command, args, env vars, encrypted secrets, and a Cashu payment token. |
+| **5402** | Workflow Result | Worker → Relay → User | Published by the runner script after `act` completes. Contains status (success/failed), duration, exit code, and a Blossom URL to the full act log. |
+| **5101** | Loom Result | Worker → Relay → User | The Loom worker's own result event. Contains exit code, stdout/stderr Blossom URLs, and optionally a Cashu change token (refund for unused compute time). |
+| **30100** | Loom Status | Worker → Relay → User | Replaceable status updates from the worker during execution (e.g., `queued`, `running`, `success`). |
+| **10100** | Worker Advertisement | Worker → Relay | Workers advertise themselves with name, architecture, pricing, supported mints, and queue depth. The extension queries these to populate the worker picker. |
 
-Flotilla discovers and renders widgets based on these events and enforces privileged actions based on declared permissions.
+### Event Chain
 
-## Template Features
+When a user triggers a run, the extension creates two events in sequence:
 
-- Svelte 5 iframe app example (Smart Widget "tool" pattern)
-- Framework-agnostic shared bridge package
-- TypeScript strict mode
-- Monorepo via pnpm workspaces
-- Unit tests (Vitest) + E2E tests (Playwright)
-- Smart Widget generator CLI (outputs kind `30033` event + optional `/.well-known/widget.json`)
+1. **Kind 5401** (Workflow Run): Signed via the host's signer, published to the repo's relays. The signed event's `id` becomes the **run ID** — the primary identifier for the entire pipeline execution.
+
+2. **Kind 5100** (Loom Job): Also signed via the host. References the run ID in an `['e', runId]` tag. Contains:
+   - `['p', workerPubkey]` — which worker should execute this
+   - `['cmd', 'bash']` + `['args', ...]` — the runner script (inlined as a bash heredoc)
+   - `['payment', cashuToken]` — prepaid Cashu token for the worker
+   - `['env', key, value]` tags — environment variables (repo URL, branch, commit, relay list)
+   - `['secret', key, encryptedValue]` tags — NIP-44 encrypted secrets (the ephemeral nsec, user-provided secrets)
+
+The worker picks up the 5100 event, executes the command, and publishes status/result events back to the same relays.
+
+### Worker Discovery
+
+Workers are discovered by querying **kind 10100** events from the repo's relays. Each worker advertisement contains:
+- Name, description, architecture (e.g., `x86_64`)
+- Supported `act` version
+- Pricing (per-second rate, accepted Cashu mints)
+- Queue depth and concurrency limits
+- Online status (derived from recency of the advertisement)
+
+Workers are sorted by online status and queue depth. The user selects a worker from the picker before submitting a run.
+
+### Secrets and Encryption
+
+The extension generates an **ephemeral keypair** for each run. The ephemeral secret key is NIP-44 encrypted to the worker's pubkey and passed as the `HIVE_CI_NSEC` secret. The runner script uses this nsec to:
+- Upload the act log to Blossom (authenticated upload)
+- Publish the kind 5402 workflow result event
+
+User-provided secrets (e.g., API keys) are also NIP-44 encrypted to the worker and passed as `['secret', key, ciphertext]` tags.
+
+All encryption is delegated to the host via the `nostr:nip44Encrypt` bridge handler — the extension never accesses `window.nostr` or any private key material directly.
+
+### Payment Flow
+
+Runs are prepaid with **Cashu tokens**. The extension:
+1. Queries the user's Cashu wallet balance via the host bridge
+2. Shows compatible mints (intersection of user's mints and worker's accepted mints)
+3. Generates a Cashu token for the selected amount and mint
+4. Includes the token in the 5100 event's `['payment', token]` tag
+
+If the run finishes early, the worker may return a **change token** in the 5101 result event's `['change', token]` tag.
+
+### Real-Time Updates
+
+The extension uses **Nostr's native pub/sub** for live updates — no polling:
+
+1. On load, it does a one-time `nostr:query` to fetch existing runs and their associated events.
+2. It then opens a persistent `nostr:subscribe` WebSocket subscription filtering for kinds `[5401, 5100, 5402, 5101, 30100]` with the repo's `#a` tag.
+3. Incoming events are **merged directly into local state** via `mergeEventIntoRuns()` / `mergeEventIntoDetail()` — no additional relay queries are triggered.
+4. When viewing an active run, a second narrower subscription is opened with `#e` filters for the specific run and loom job IDs.
+
+### Runner Script
+
+The extension generates a **bash runner script** that is inlined into the loom job's args. The script:
+
+1. Clones the Nostr repository using `ngit` (Nostr-native git)
+2. Checks out the specified branch and commit
+3. Runs GitHub Actions workflows using [`act`](https://github.com/nektos/act)
+4. Uploads the act log to Blossom (content-addressed storage)
+5. Publishes a kind 5402 workflow result event with status, duration, and log URL
+
+The script template is auto-generated based on the selected workflow, worker, and branch, but can be manually edited before submission.
+
+### Host Bridge Integration
+
+The extension runs as an iframe and communicates with Flotilla via the **Widget Bridge** protocol (`postMessage`-based). It delegates all privileged operations to the host:
+
+| Bridge Action | Purpose |
+|--------------|---------|
+| `nostr:query` | Fetch existing events from relays |
+| `nostr:publish` | Sign unsigned events with the host's signer and publish to relays. Returns the signed event's `id`. |
+| `nostr:subscribe` | Open persistent WebSocket subscriptions. Events stream back via `nostr:subscription:event` bridge events. |
+| `nostr:nip44Encrypt` | Encrypt plaintext to a recipient pubkey using the host's NIP-44 signer. |
+| `context:getRepo` | Fetch repository context (pubkey, name, naddr, relays). |
+| `repo:listWorkflows` | List `.github/workflows/*.yml` files from the git repo. |
+| `repo:getBranches` | Get branch list and default branch. |
+| `storage:get/set` | Persist extension state (repo-scoped). |
+| `ui:toast` | Show toast notifications in the host UI. |
+
+The user's pubkey is provided by the host via `context:update` / `widget:init` events. The extension never uses `window.nostr` or NIP-07 directly — all signing is handled transparently by the host.
+
+### Declared Permissions
+
+The widget's kind 30033 manifest declares these permissions:
+
+```
+nostr:publish, nostr:query, nostr:subscribe, nostr:nip44Encrypt, ui:toast
+```
+
+Flotilla enforces these — bridge requests for undeclared actions are rejected.
+
+## Features
+
+- **View workflow runs** — Browse all pipeline executions with status indicators, duration, and branch info
+- **Real-time status** — Live updates via Nostr WebSocket subscriptions, no polling
+- **Inspect run details** — Full event chain (run → job → status → result), parsed act logs, stdout/stderr
+- **Trigger new runs** — Select workflow, branch, worker, and payment amount
+- **Rerun failed jobs** — Reuse prior job metadata with fresh payment and secrets
+- **Worker discovery** — Live worker advertisements with pricing, queue depth, and mint compatibility
+- **Cashu payments** — Wallet-aware mint selection, auto-token generation prompts
+- **Search and filter** — Find runs by name, status, branch, commit, or actor
 
 ## Quick Start
 
@@ -58,211 +162,98 @@ The widget iframe app will be available at `http://localhost:5173`.
 pnpm build
 ```
 
-### 4) Generate Smart Widget files (kind 30033)
-
-This writes:
-- `dist/widget/event.json` (unsigned kind `30033` event)
-- `dist/widget/widget.json` (optional `/.well-known/widget.json` file)
-- `dist/widget/PUBLISHING.md` (signing + publishing instructions)
+### 4) Generate Smart Widget manifest (kind 30033)
 
 ```bash
-pnpm manifest:generate \
-  --type tool \
-  --title 'My Smart Widget' \
-  --app-url 'https://cdn.example.com/my-widget/index.html' \
-  --icon 'https://cdn.example.com/my-widget/icon.png' \
-  --image 'https://cdn.example.com/my-widget/preview.png' \
-  --button-title 'Open' \
-  --permissions 'nostr:publish,ui:toast'
+pnpm manifest:generate
 ```
 
-Notes:
-- `--identifier` is optional; if omitted it will be derived.
-- `--pubkey` is optional; if provided, publishing instructions can include an `naddr` hint.
+This writes `dist/widget/event.json` (unsigned kind 30033), `dist/widget/widget.json`, and `dist/widget/PUBLISHING.md`.
 
-## Bridge Protocol (Action-Based)
-
-Flotilla uses an action-based postMessage protocol:
-
-- Widget -> Host requests:
-  - `{ type: 'request', id, action, payload }`
-- Host -> Widget responses:
-  - `{ type: 'response', id, action, payload }`
-- Host -> Widget events:
-  - `{ type: 'event', action, payload }`
-
-This template’s shared package provides a typed `WidgetBridge` with:
-
-- `request(action, payload) -> Promise<responsePayload>`
-- `onEvent(action, handler)` for host-initiated events (lifecycle: `widget:init`, `widget:mounted`, `widget:unmounting`)
-- `onRequest(action, handler)` for bidirectional "tool" widgets (host can request work from the iframe)
-
-### Example: publish a note + show a toast
-
-```ts
-import { WidgetBridge, createEvent } from '@flotilla/ext-shared';
-
-const bridge = new WidgetBridge();
-
-async function publishNote(content: string) {
-  const event = createEvent(1, content, []);
-  const res = await bridge.request('nostr:publish', event);
-
-  if ('error' in res) {
-    await bridge.request('ui:toast', { message: res.error, type: 'error' });
-    return;
-  }
-
-  await bridge.request('ui:toast', { message: 'Published', type: 'success' });
-}
-```
-
-### Handle lifecycle events
-
-The host sends lifecycle events at key moments:
-
-```ts
-// Receive initial context on init
-bridge.onEvent('widget:init', (payload) => {
-  console.log('Extension ID:', payload.extensionId);
-  console.log('Host version:', payload.hostVersion);
-  if (payload.repoContext) {
-    console.log('Repository:', payload.repoContext.fullName);
-  }
-});
-
-// Know when bridge is ready for operations
-bridge.onEvent('widget:mounted', (payload) => {
-  console.log('Mounted at:', payload.mountedAt);
-  initializeWidget();
-});
-
-// Cleanup before removal
-bridge.onEvent('widget:unmounting', (payload) => {
-  console.log('Unmounting, reason:', payload.reason);
-  saveState();
-  bridge.destroy();
-});
-```
-
-For repository context changes, handle `context:repoUpdate`. To proactively fetch context, use `bridge.request('context:getRepo', {})`.
-
-## Permissions
-
-Smart Widgets can declare permissions using `permission` tags (one per permission). This template defaults to:
-
-- `nostr:publish`
-- `ui:toast`
-
-Flotilla may treat some actions as privileged (for example `nostr:*` and `storage:*`) and enforce them based on the widget’s declared permissions.
-
-## Project Structure (Monorepo)
+## Project Structure
 
 ```
-flotilla-extension-template/
+budabit-pipelines-extension/
 ├── packages/
-│   ├── shared/          # Framework-agnostic bridge + types + signaling helpers
-│   ├── iframe-app/      # Svelte 5 iframe app (Smart Widget tool demo)
-│   ├── worker/          # Optional stubbed worker bridge (action protocol)
-│   ├── manifest/        # CLI: generates kind 30033 + widget.json + instructions
-│   └── test-utils/      # Mocks for bridge/testing
-├── docs/                # Documentation (Smart Widget-focused)
+│   ├── shared/          # Framework-agnostic bridge types + signaling helpers
+│   ├── iframe-app/      # Svelte 5 iframe app (the actual widget UI)
+│   │   └── src/
+│   │       ├── App.svelte           # Main component: run list, detail panel, submission forms
+│   │       └── lib/
+│   │           ├── pipelines.ts     # Nostr event querying, parsing, and real-time merge logic
+│   │           ├── nip07.ts         # Event construction, bridge-delegated signing + encryption
+│   │           ├── subscriptions.ts # Persistent Nostr WebSocket subscriptions via bridge
+│   │           ├── controllers.ts   # Orchestrates bridge calls for each user action
+│   │           ├── view-model.ts    # Composes controllers into UI state transitions
+│   │           ├── runner-script.ts # Generates the bash runner script for act
+│   │           ├── context.ts       # Transforms host repo context into normalized form
+│   │           ├── widget-lifecycle.ts # Bridge setup, context fetching, lifecycle events
+│   │           ├── types.ts         # All TypeScript interfaces
+│   │           ├── wallet.ts        # Cashu wallet queries via bridge
+│   │           ├── payment.ts       # Cashu token parsing
+│   │           ├── submission.ts    # Worker/mint selection logic
+│   │           ├── submission-state.ts # Form state initialization
+│   │           ├── detail-session.ts   # Run detail panel state machine
+│   │           ├── presentation.ts  # Formatting helpers (time, duration, status badges)
+│   │           ├── wallet-prompt.ts # Auto-token generation prompt logic
+│   │           ├── cicd.ts          # YAML workflow parser, act log parser
+│   │           ├── repo.ts          # Repo metadata loading (workflows, branches)
+│   │           └── components/      # Svelte sub-components
+│   ├── manifest/        # CLI: generates kind 30033 + widget.json
+│   ├── worker/          # Worker bridge stub
+│   └── test-utils/      # Bridge mocks for testing
+├── docs/                # Documentation
 ├── e2e/                 # Playwright E2E tests
-└── [config files]       # ESLint, Prettier, TypeScript, etc.
+└── [config files]
 ```
 
-## Package Overview
+## Bridge Protocol
 
-### `@flotilla/ext-shared`
+Flotilla uses an action-based `postMessage` protocol:
 
-Shared, framework-agnostic code:
+- **Widget → Host requests**: `{ type: 'request', id, action, payload }`
+- **Host → Widget responses**: `{ type: 'response', id, action, payload }`
+- **Host → Widget events**: `{ type: 'event', action, payload }`
 
-- `WidgetBridge`: typed action-based postMessage bridge compatible with Flotilla
-- Smart Widget message/types: `WidgetWireMessage`, `WidgetActionMap`, `WidgetContext`
-- Nostr helpers: `createEvent`, `validateEvent`, and related signaling utilities
+The shared package provides a typed `WidgetBridge` with:
+- `request(action, payload)` → `Promise<response>`
+- `onEvent(action, handler)` — for host-initiated lifecycle events
+- `onRequest(action, handler)` — for bidirectional tool interactions
 
-### `@flotilla/ext-iframe`
+### Lifecycle Events
 
-Svelte 5 iframe app demonstrating a Smart Widget "tool":
+| Event | When |
+|-------|------|
+| `widget:init` | Bridge ready, includes host version and optional repo context |
+| `widget:mounted` | Widget is visible in the DOM |
+| `widget:unmounting` | Widget is about to be removed |
+| `context:update` / `context:repoUpdate` | Repository context changed (navigation) |
+| `nostr:subscription:event` | Incoming Nostr event from a persistent subscription |
 
-- Calls host actions via `bridge.request('nostr:publish', ...)`
-- Calls UI actions via `bridge.request('ui:toast', ...)`
-- Handles lifecycle events: `widget:init`, `widget:mounted`, `widget:unmounting`
-- Handles `context:repoUpdate` for repository context changes
+## Documentation
 
-### `@flotilla/ext-manifest`
-
-Smart Widget generator CLI:
-
-- Generates unsigned kind `30033` event JSON
-- Generates `widget.json` for optional `/.well-known/widget.json` hosting
-- Generates `PUBLISHING.md` with signing + publishing steps (including naddr hint when possible)
-
-### `@flotilla/test-utils`
-
-Testing helpers and bridge mocks compatible with the action protocol.
-
-### `@flotilla/ext-worker`
-
-Optional worker stub aligned with the same action-based protocol.
+Extended docs in `docs/`:
+- [Architecture](./docs/architecture.md) — System design and package structure
+- [Host Bridge](./docs/host-bridge.md) — Host integration guide
+- [Lifecycle Events](./docs/lifecycle.md) — Widget initialization, mount, and cleanup
+- [Storage API](./docs/storage.md) — Persistent data storage
+- [Slot System](./docs/slots.md) — Where widgets can be mounted
+- [Manifest](./docs/manifest.md) — Kind 30033 event structure
+- [Security](./docs/security.md) — Security guidelines
+- [Quick Start](./docs/quickstart.md) — Getting started guide
 
 ## Common Commands
 
 ```bash
-pnpm dev
-pnpm build
-pnpm test
-pnpm test:coverage
-pnpm e2e
-pnpm verify
-pnpm manifest:generate
+pnpm dev              # Start local dev server
+pnpm build            # Build all packages
+pnpm test             # Run unit tests
+pnpm test:coverage    # Run tests with coverage
+pnpm e2e              # Run Playwright E2E tests
+pnpm verify           # Lint + type-check + test
+pnpm manifest:generate # Generate Smart Widget manifest
 ```
-
-## Publishing (High Level)
-
-1) Build the iframe app:
-```bash
-pnpm build
-```
-
-2) Host the iframe HTML somewhere reachable by Flotilla (typically on HTTPS):
-- `packages/iframe-app/dist/index.html`
-
-3) Generate Smart Widget files:
-```bash
-pnpm manifest:generate \
-  --type tool \
-  --title 'My Smart Widget' \
-  --app-url 'https://cdn.example.com/my-widget/index.html' \
-  --icon 'https://cdn.example.com/my-widget/icon.png' \
-  --image 'https://cdn.example.com/my-widget/preview.png'
-```
-
-4) Sign and publish the generated kind `30033` event using `nostr-tools` (see `dist/widget/PUBLISHING.md`).
-
-## Documentation
-
-Smart Widget docs live in `docs/` and cover:
-- [Architecture](./docs/architecture.md) - System design and package structure
-- [Host Bridge](./docs/host-bridge.md) - Host integration guide
-- [Lifecycle Events](./docs/lifecycle.md) - Widget initialization, mount, and cleanup
-- [Storage API](./docs/storage.md) - Persistent data storage
-- [Slot System](./docs/slots.md) - Where widgets can be mounted
-- [Manifest](./docs/manifest.md) - Kind 30033 event structure
-- [Security](./docs/security.md) - Security guidelines
-- [Quick Start](./docs/quickstart.md) - Getting started guide
-
-### Extension Types in Flotilla
-
-Flotilla supports two complementary extension models:
-
-| Model | Event Kind | Discovery | Use Case |
-|-------|-----------|-----------|----------|
-| **Smart Widgets** (this template) | 30033 | YakiHonne relays | Rich, event-based widgets rendered inline or in iframes |
-| **NIP-89 Manifest Extensions** | 31990 | INDEXER_RELAYS or HTTPS URL | Full iframe apps with JSON manifests |
-
-For comprehensive documentation covering both models, including migration guidance and interoperability, see the [Flotilla Extension Developer Guide](../../docs/extensions/README.md).
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) file for details.
+MIT License — see [LICENSE](LICENSE) file for details.

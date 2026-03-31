@@ -91,6 +91,17 @@ export interface WorkflowRunDetail {
   worker?: LoomWorker | null;
 }
 
+export interface WorkflowDefinition {
+  name: string;
+  path: string;
+  content: string;
+}
+
+export interface RepoBranchInfo {
+  name: string;
+  commitId?: string;
+}
+
 export interface RerunDraft {
   repoNaddr: string;
   workflowPath: string;

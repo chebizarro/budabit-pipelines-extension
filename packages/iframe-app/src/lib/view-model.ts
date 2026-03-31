@@ -93,6 +93,7 @@ export async function submitRunViewModel(args: {
   rerunSecrets: Array<{ key: string; value: string }>;
 }) {
   const runId = await submitRunController({
+    bridge: args.bridge,
     signerPubkey: args.signerPubkey,
     submissionMode: args.submissionMode,
     rerunCommandMode: args.rerunCommandMode,

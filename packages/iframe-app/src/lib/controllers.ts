@@ -66,6 +66,7 @@ export async function generatePaymentTokenController(
 }
 
 export async function submitRunController(args: {
+  bridge: WidgetBridge
   signerPubkey: string
   submissionMode: 'new' | 'rerun' | null
   rerunCommandMode: 'reuse' | 'regenerate'
@@ -76,6 +77,7 @@ export async function submitRunController(args: {
   rerunSecrets: Array<{ key: string; value: string }>
 }) {
   const {
+    bridge,
     signerPubkey,
     submissionMode,
     rerunCommandMode,
@@ -113,6 +115,7 @@ export async function submitRunController(args: {
   }
 
   return submitRerun(
+    bridge,
     signerPubkey,
     nextDraft,
     rerunPaymentToken.trim(),

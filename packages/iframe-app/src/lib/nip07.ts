@@ -1,19 +1,6 @@
-import { SimplePool, generateSecretKey, getPublicKey, nip19, type Event, type UnsignedEvent } from 'nostr-tools';
+import { generateSecretKey, getPublicKey, nip19 } from 'nostr-tools';
+import type { WidgetBridge } from '@flotilla/ext-shared';
 import type { RerunDraft } from './types';
-
-interface NostrWindowSigner {
-  getPublicKey(): Promise<string>;
-  signEvent(event: UnsignedEvent): Promise<Event>;
-  nip44?: {
-    encrypt(pubkey: string, plaintext: string): Promise<string>;
-  };
-}
-
-declare global {
-  interface Window {
-    nostr?: NostrWindowSigner;
-  }
-}
 
 function hexFromBytes(bytes: Uint8Array): string {
   return Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('');
@@ -23,46 +10,69 @@ function currentTimestamp(): number {
   return Math.floor(Date.now() / 1000);
 }
 
-async function publishEvent(relays: string[], event: Event): Promise<void> {
-  const uniqueRelays = Array.from(new Set(relays.filter(Boolean)));
-  const pool = new SimplePool();
+/**
+ * Sign an unsigned event via the host bridge and publish it to relays.
+ * Returns the signed event's id.
+ */
+async function signAndPublish(
+  bridge: WidgetBridge,
+  unsignedEvent: Record<string, unknown>,
+  relays: string[],
+): Promise<string> {
+  const res: any = await bridge.request('nostr:publish', { event: unsignedEvent, relays });
 
-  try {
-    await Promise.allSettled(pool.publish(uniqueRelays, event));
-  } finally {
-    pool.close(uniqueRelays);
-  }
-}
-
-export function getNip07Signer(): NostrWindowSigner | null {
-  return window.nostr || null;
-}
-
-export async function connectNip07Signer(): Promise<string> {
-  const signer = getNip07Signer();
-  if (!signer) {
-    throw new Error('No NIP-07 signer found in this browser.');
+  if (res?.error) {
+    throw new Error(`Publish failed: ${res.error}`);
   }
 
-  return signer.getPublicKey();
+  const eventId = res?.result?.eventId ?? res?.eventId;
+  if (!eventId || typeof eventId !== 'string') {
+    throw new Error('Host did not return the signed event id after publishing.');
+  }
+
+  return eventId;
 }
 
+/**
+ * Encrypt plaintext to a recipient pubkey using the host's NIP-44 signer.
+ */
+async function nip44Encrypt(
+  bridge: WidgetBridge,
+  recipientPubkey: string,
+  plaintext: string,
+): Promise<string> {
+  const res: any = await bridge.request('nostr:nip44Encrypt', { recipientPubkey, plaintext });
+
+  if (res?.error) {
+    throw new Error(`NIP-44 encryption failed: ${res.error}`);
+  }
+
+  const ciphertext = res?.ciphertext;
+  if (!ciphertext || typeof ciphertext !== 'string') {
+    throw new Error('Host did not return ciphertext from NIP-44 encryption.');
+  }
+
+  return ciphertext;
+}
+
+/**
+ * Submit a workflow run + loom job via the host bridge.
+ *
+ * All signing, encryption, and publishing is delegated to the host —
+ * no direct window.nostr / NIP-07 usage.
+ */
 export async function submitRerun(
+  bridge: WidgetBridge,
   signerPubkey: string,
   draft: RerunDraft,
   paymentToken: string,
   secrets: Array<{ key: string; value: string }>
 ): Promise<string> {
-  const signer = getNip07Signer();
-  if (!signer) throw new Error('No NIP-07 signer found in this browser.');
-  if (!signer.nip44?.encrypt) {
-    throw new Error('This NIP-07 signer does not expose NIP-44 encryption.');
-  }
-
   const ephemeralSecretKey = generateSecretKey();
   const ephemeralPubkey = getPublicKey(ephemeralSecretKey);
   const ephemeralSecretKeyHex = hexFromBytes(ephemeralSecretKey);
 
+  // 1. Build and publish the workflow run event (kind 5401)
   const workflowRunEvent = {
     kind: 5401,
     created_at: currentTimestamp(),
@@ -78,11 +88,11 @@ export async function submitRerun(
       ['t', 'hive-ci'],
     ],
     pubkey: signerPubkey,
-  } satisfies UnsignedEvent;
+  };
 
-  const runEvent = await signer.signEvent(workflowRunEvent);
-  const runId = runEvent.id;
+  const runId = await signAndPublish(bridge, workflowRunEvent, draft.publishRelays);
 
+  // 2. Encrypt secrets via the host's NIP-44 signer
   const envTags: string[][] = [
     ['env', 'HIVE_CI_RUN_ID', runId],
     ['env', 'HIVE_CI_REPOSITORY', draft.repoNostrUrl],
@@ -96,15 +106,17 @@ export async function submitRerun(
       .map(entry => ['env', entry.key.trim(), entry.value]),
   ];
 
+  const encryptedNsec = await nip44Encrypt(bridge, draft.workerPubkey, ephemeralSecretKeyHex);
   const secretTags: string[][] = [
-    ['secret', 'HIVE_CI_NSEC', await signer.nip44.encrypt(draft.workerPubkey, ephemeralSecretKeyHex)],
+    ['secret', 'HIVE_CI_NSEC', encryptedNsec],
   ];
 
   for (const secret of secrets.filter(entry => entry.key.trim() && entry.value.trim())) {
-    const encrypted = await signer.nip44.encrypt(draft.workerPubkey, secret.value);
+    const encrypted = await nip44Encrypt(bridge, draft.workerPubkey, secret.value);
     secretTags.push(['secret', secret.key.trim(), encrypted]);
   }
 
+  // 3. Build and publish the loom job event (kind 5100)
   const loomJobEvent = {
     kind: 5100,
     created_at: currentTimestamp(),
@@ -119,12 +131,9 @@ export async function submitRerun(
       ...secretTags,
     ],
     pubkey: signerPubkey,
-  } satisfies UnsignedEvent;
+  };
 
-  const signedLoomJobEvent = await signer.signEvent(loomJobEvent);
-
-  await publishEvent(draft.publishRelays, runEvent);
-  await publishEvent(draft.publishRelays, signedLoomJobEvent);
+  await signAndPublish(bridge, loomJobEvent, draft.publishRelays);
 
   return runId;
 }
