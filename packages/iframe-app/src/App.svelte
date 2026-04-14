@@ -255,7 +255,11 @@
   }
 
   async function refreshRuns(nextRepo: RepoContextNormalized | null = repo, background = false) {
-    if (!bridge || !nextRepo) return
+    if (!bridge || !nextRepo) {
+      console.log('[pipelines] refreshRuns skipped: bridge=', !!bridge, 'nextRepo=', !!nextRepo)
+      return
+    }
+    console.log('[pipelines] refreshRuns: repo=', nextRepo.repoName, 'naddr=', nextRepo.repoNaddr?.slice(0, 30), 'relays=', nextRepo.repoRelays)
 
     const seq = ++loadSeq
     if (!background) {
@@ -327,17 +331,23 @@
   }
 
   async function refreshRepoMetadata() {
-    if (!bridge || !repo) return
+    if (!bridge || !repo) {
+      console.log('[pipelines] refreshRepoMetadata skipped: bridge=', !!bridge, 'repo=', !!repo)
+      return
+    }
 
     repoMetadataLoading = true
     repoMetadataError = null
 
     try {
+      console.log('[pipelines] refreshRepoMetadata: calling repo:listWorkflows...')
       const metadata = await loadRepoMetadata(bridge)
+      console.log('[pipelines] refreshRepoMetadata: got', metadata.workflows.length, 'workflows,', metadata.branches.length, 'branches')
       repoWorkflows = metadata.workflows
       repoBranches = metadata.branches
       defaultBranch = metadata.selectedBranch || metadata.defaultBranch || 'main'
     } catch (err) {
+      console.error('[pipelines] refreshRepoMetadata error:', err)
       repoMetadataError = friendlyErrorMessage(err instanceof Error ? err.message : String(err))
     } finally {
       repoMetadataLoading = false
@@ -1035,6 +1045,15 @@
           <div class="flex flex-col items-center justify-center rounded-lg border border-border bg-card py-16 text-muted-foreground">
             <SearchX class="mb-3 h-8 w-8" />
             <p class="text-sm">No pipeline runs found.</p>
+            {#if repo}
+              <p class="mt-2 max-w-md text-xs">
+                Queried relays: {repo.repoRelays.join(', ') || 'none'}<br/>
+                Repo naddr: {repo.repoNaddr ? repo.repoNaddr.slice(0, 40) + '…' : 'not set'}<br/>
+                Workflows: {repoWorkflows.length} found
+              </p>
+            {:else}
+              <p class="mt-2 text-xs text-yellow-400">Repository context not received from host.</p>
+            {/if}
           </div>
         {:else}
           <div class="space-y-2">
