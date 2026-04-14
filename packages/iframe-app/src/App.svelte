@@ -8,6 +8,7 @@
     Clock,
     Copy,
     ExternalLink,
+    FileCheck,
     Filter,
     GitBranch,
     GitCommit,
@@ -52,6 +53,7 @@
   import ConsoleOutput from './lib/components/ConsoleOutput.svelte'
   import WorkflowJobs from './lib/components/WorkflowJobs.svelte'
   import WorkflowLogs from './lib/components/WorkflowLogs.svelte'
+  import ReleaseSigningView from './lib/components/ReleaseSigningView.svelte'
   import {loadRunDetailController, refreshRunsController} from './lib/controllers'
   import {
     createSubmissionResetState,
@@ -155,6 +157,8 @@
   let statusFilter = $state<string>('all')
   let showFilters = $state(false)
   let showRawEvents = $state(false)
+
+  let currentView = $state<'pipelines' | 'releases'>('pipelines')
 
   let loadSeq = 0
   let detailSeq = 0
@@ -925,6 +929,33 @@
 
 <div class="min-h-screen bg-background p-4 text-foreground">
   <div class="mx-auto max-w-7xl space-y-4">
+    <!-- Tab Switcher -->
+    <div class="flex items-center gap-1 border-b border-border">
+      <button
+        class={`inline-flex items-center gap-2 border-b-2 px-4 py-2.5 text-sm font-medium transition-colors ${currentView === 'pipelines' ? 'border-primary text-primary' : 'border-transparent text-muted-foreground hover:text-foreground'}`}
+        onclick={() => (currentView = 'pipelines')}
+      >
+        <Workflow class="h-4 w-4" />
+        Pipelines
+      </button>
+      <button
+        class={`inline-flex items-center gap-2 border-b-2 px-4 py-2.5 text-sm font-medium transition-colors ${currentView === 'releases' ? 'border-primary text-primary' : 'border-transparent text-muted-foreground hover:text-foreground'}`}
+        onclick={() => (currentView = 'releases')}
+      >
+        <FileCheck class="h-4 w-4" />
+        Releases
+      </button>
+    </div>
+
+    {#if currentView === 'releases'}
+      {#if bridge && repo}
+        <ReleaseSigningView {bridge} {repo} />
+      {:else}
+        <div class="rounded-lg border border-border bg-card/50 p-8 text-center text-sm text-muted-foreground">
+          Waiting for repository context…
+        </div>
+      {/if}
+    {:else}
     <div class="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
       <div>
         <div class="flex items-center gap-2">
@@ -1437,5 +1468,6 @@
         {/if}
       </aside>
     </div>
+    {/if}
   </div>
 </div>
