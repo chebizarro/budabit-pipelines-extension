@@ -78,7 +78,7 @@ export async function submitRerun(
     created_at: currentTimestamp(),
     content: '',
     tags: [
-      ['a', draft.repoNaddr],
+      ['a', draft.repoAddress],
       ['workflow', draft.workflowPath],
       ['triggered-by', signerPubkey],
       ['publisher', ephemeralPubkey],
@@ -138,11 +138,11 @@ export async function submitRerun(
   return runId;
 }
 
-export function toRepoNostrUrl(repoNaddr: string | undefined, relays: string[]): string {
-  if (!repoNaddr) return '';
+export function toRepoNostrUrl(repoAddress: string | undefined, relays: string[]): string {
+  if (!repoAddress) return '';
 
   try {
-    const parts = repoNaddr.split(':');
+    const parts = repoAddress.split(':');
     if (parts.length !== 3) return '';
 
     const [, pubkey, identifier] = parts;

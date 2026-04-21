@@ -39,12 +39,12 @@ export function canGenerateSuggestedToken(args: {
 }
 
 export function createNewRunDraft(repo: RepoContextNormalized): RerunDraft | null {
-  if (!repo.repoNaddr) return null
+  if (!repo.repoAddress) return null
 
   const publishRelays = Array.from(new Set([...repo.repoRelays, 'wss://relay.sharegap.net', 'wss://nos.lol']))
 
   return {
-    repoNaddr: repo.repoNaddr,
+    repoAddress: repo.repoAddress,
     workflowPath: '',
     branch: 'main',
     commit: '',
@@ -52,7 +52,7 @@ export function createNewRunDraft(repo: RepoContextNormalized): RerunDraft | nul
     command: 'bash',
     args: ['-lc', 'echo "Runner script will be injected at submit time"'],
     envVars: [],
-    repoNostrUrl: toRepoNostrUrl(repo.repoNaddr, publishRelays),
+    repoNostrUrl: toRepoNostrUrl(repo.repoAddress, publishRelays),
     publishRelays,
   }
 }

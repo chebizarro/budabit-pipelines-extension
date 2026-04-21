@@ -626,14 +626,14 @@
     let subId: string | null = null
     const relays = [...new Set([...currentRepo.repoRelays, ...FALLBACK_RELAYS])]
 
-    if (currentRepo.repoNaddr) {
+    if (currentRepo.repoAddress) {
       void subscribe(currentBridge, relays, {
         kinds: [5401, 5100, 5402, 5101, 30100],
-        '#a': [currentRepo.repoNaddr],
+        '#a': [currentRepo.repoAddress],
         since: Math.floor(Date.now() / 1000) - 60,
       }, (event) => {
         // Merge the incoming event directly into the run list
-        workflowRuns = mergeEventIntoRuns(workflowRuns, event, currentRepo.repoNaddr)
+        workflowRuns = mergeEventIntoRuns(workflowRuns, event, currentRepo.repoAddress)
         lastLiveRefreshAt = Date.now()
 
         // Also update the selected detail if it matches
