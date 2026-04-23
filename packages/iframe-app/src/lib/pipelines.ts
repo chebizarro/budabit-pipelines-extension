@@ -233,15 +233,15 @@ export async function loadWorkflowRuns(
 ): Promise<WorkflowRun[]> {
   const relays = dedupe([...repo.repoRelays, ...FALLBACK_RELAYS]);
 
-  if (!repo.repoNaddr) {
-    console.log('[pipelines] loadWorkflowRuns: no repoNaddr, returning empty');
+  if (!repo.repoAddress) {
+    console.log('[pipelines] loadWorkflowRuns: no repoAddress, returning empty');
     return [];
   }
 
   const runEvents = await queryEvents(bridge, relays, [
     {
       kinds: [5401],
-      '#a': [repo.repoNaddr],
+      '#a': [repo.repoAddress],
       limit: 100,
     },
   ]);
@@ -250,7 +250,7 @@ export async function loadWorkflowRuns(
     const legacyJobEvents = await queryEvents(bridge, relays, [
       {
         kinds: [5100],
-        '#a': [repo.repoNaddr],
+        '#a': [repo.repoAddress],
         limit: 50,
       },
     ]);
@@ -498,7 +498,7 @@ export function buildRerunDraft(
   detail: WorkflowRunDetail | null
 ): RerunDraft | null {
   const loomJobEvent = detail?.run.loomJobEvent;
-  if (!repo.repoNaddr || !loomJobEvent) return null;
+  if (!repo.repoAddress || !loomJobEvent) return null;
 
   const command = eventTagValue(loomJobEvent, 'cmd');
   const argsTag = loomJobEvent.tags.find((tag) => tag[0] === 'args');
@@ -517,7 +517,7 @@ export function buildRerunDraft(
   const publishRelays = dedupe([...repo.repoRelays, ...FALLBACK_RELAYS]);
 
   return {
-    repoNaddr: repo.repoNaddr,
+    repoAddress: repo.repoAddress,
     workflowPath: detail?.run.workflowPath || eventTagValue(detail?.run.runEvent, 'workflow') || '',
     branch: detail?.run.branch || eventTagValue(detail?.run.runEvent, 'branch') || 'main',
     commit: detail?.run.commit || eventTagValue(detail?.run.runEvent, 'commit') || '',
@@ -525,7 +525,7 @@ export function buildRerunDraft(
     command,
     args: argsTag.slice(1),
     envVars,
-    repoNostrUrl: toRepoNostrUrl(repo.repoNaddr, publishRelays),
+    repoNostrUrl: toRepoNostrUrl(repo.repoAddress, publishRelays),
     publishRelays,
   };
 }
@@ -548,7 +548,7 @@ export function buildRerunDraft(
 export function mergeEventIntoRuns(
   runs: WorkflowRun[],
   event: NostrEvent,
-  repoNaddr?: string,
+  repoAddress?: string,
 ): WorkflowRun[] {
   const kind = event.kind;
 
@@ -556,7 +556,7 @@ export function mergeEventIntoRuns(
   if (kind === 5401) {
     if (runs.some(r => r.id === event.id)) return runs; // duplicate
     // Only accept runs for this repo
-    if (repoNaddr && eventTagValue(event, 'a') !== repoNaddr) return runs;
+    if (repoAddress && eventTagValue(event, 'a') !== repoAddress) return runs;
     const newRun = parseWorkflowRunEvent(event);
     return [newRun, ...runs];
   }
@@ -574,7 +574,7 @@ export function mergeEventIntoRuns(
     }
     // Standalone legacy job — add if not duplicate
     if (runs.some(r => r.id === event.id)) return runs;
-    if (repoNaddr && eventTagValue(event, 'a') !== repoNaddr) return runs;
+    if (repoAddress && eventTagValue(event, 'a') !== repoAddress) return runs;
     return [parseLegacyJobEvent(event), ...runs];
   }
 

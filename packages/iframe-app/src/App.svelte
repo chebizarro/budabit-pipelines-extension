@@ -18,7 +18,6 @@
     SearchX,
     Server,
     Terminal,
-    Workflow,
   } from '@lucide/svelte'
   import {friendlyErrorMessage, normalizeRepo} from './lib/context'
   import {
@@ -38,7 +37,6 @@
     getStatusBadge,
     getStatusColor,
     getStatusIcon,
-    repoName,
     shortId,
     suggestedPaymentAmount,
   } from './lib/presentation'
@@ -103,7 +101,6 @@
   let detailError = $state<string | null>(null)
   let selectedRunId = $state<string | null>(null)
   let selectedRunDetail = $state<WorkflowRunDetail | null>(null)
-  let lastLiveRefreshAt = $state<number | null>(null)
 
   let signerPubkey = $state<string | null>(null)
   let signerError = $state<string | null>(null)
@@ -166,7 +163,6 @@
   const ACTIVE_RUN_STATUSES = ['pending', 'queued', 'running', 'in_progress'] as const
   const FALLBACK_RELAYS = ['wss://relay.sharegap.net', 'wss://nos.lol']
 
-  let useSubscriptions = $state(false)
   let runListSubId = $state<string | null>(null)
   let runDetailSubId = $state<string | null>(null)
   let liveDurationSeconds = $state<number | null>(null)
@@ -279,7 +275,6 @@
       selectedRunId = nextSelection.selectedRunId
       selectedRunDetail = nextSelection.selectedRunDetail
       if (background) {
-        lastLiveRefreshAt = Date.now()
       }
     } catch (err) {
       if (seq !== loadSeq) return
@@ -309,7 +304,6 @@
       if (detail?.run) {
         workflowRuns = workflowRuns.map(run => (run.id === detail.run.id ? {...run, ...detail.run} : run))
       }
-      lastLiveRefreshAt = Date.now()
     } catch (err) {
       if (seq !== detailSeq) return
       if (!background) {
@@ -364,7 +358,6 @@
       const detail = await loadRunDetailController(bridge, repo, run.id)
       if (seq !== detailSeq) return
       applyDetailSessionState(createOpenedDetailSessionState(detail))
-      lastLiveRefreshAt = Date.now()
     } catch (err) {
       if (seq !== detailSeq) return
       applyDetailSessionState(
@@ -417,7 +410,6 @@
   function closeRun() {
     applyDetailSessionState(createClosedDetailSessionState())
     applySubmissionReset()
-    lastLiveRefreshAt = null
   }
 
   function resetFilters() {
@@ -640,15 +632,14 @@
     let subId: string | null = null
     const relays = [...new Set([...currentRepo.repoRelays, ...FALLBACK_RELAYS])]
 
-    if (currentRepo.repoNaddr) {
+    if (currentRepo.repoAddress) {
       void subscribe(currentBridge, relays, {
         kinds: [5401, 5100, 5402, 5101, 30100],
-        '#a': [currentRepo.repoNaddr],
+        '#a': [currentRepo.repoAddress],
         since: Math.floor(Date.now() / 1000) - 60,
       }, (event) => {
         // Merge the incoming event directly into the run list
-        workflowRuns = mergeEventIntoRuns(workflowRuns, event, currentRepo.repoNaddr)
-        lastLiveRefreshAt = Date.now()
+        workflowRuns = mergeEventIntoRuns(workflowRuns, event, currentRepo.repoAddress)
 
         // Also update the selected detail if it matches
         const detail = selectedRunDetail
@@ -662,7 +653,6 @@
         subId = id
         if (id) {
           runListSubId = id
-          useSubscriptions = true
         }
       })
     }
@@ -710,7 +700,6 @@
       }
       // Also update the run in the list
       workflowRuns = mergeEventIntoRuns(workflowRuns, event)
-      lastLiveRefreshAt = Date.now()
     }).then(id => {
       subId = id
       if (id) {
@@ -917,7 +906,6 @@
         closeRun()
         repoWorkflows = []
         repoBranches = []
-        useSubscriptions = false
       },
       onUnmount: () => {
         loadSeq += 1
@@ -930,7 +918,6 @@
           unsubscribeAll(currentBridge)
           subListenerCleanup = null
         }
-        useSubscriptions = false
         closeRun()
       },
     })
@@ -945,7 +932,6 @@
         class={`inline-flex items-center gap-2 border-b-2 px-4 py-2.5 text-sm font-medium transition-colors ${currentView === 'pipelines' ? 'border-primary text-primary' : 'border-transparent text-muted-foreground hover:text-foreground'}`}
         onclick={() => (currentView = 'pipelines')}
       >
-        <Workflow class="h-4 w-4" />
         Pipelines
       </button>
       <button
@@ -966,28 +952,18 @@
         </div>
       {/if}
     {:else}
-    <div class="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
-      <div>
-        <div class="flex items-center gap-2">
-          <Workflow class="h-5 w-5 text-primary" />
-          <h2 class="text-xl font-semibold">CI/CD Pipelines</h2>
-          {#if lastLiveRefreshAt}
-            <span class="rounded-full border border-border px-2 py-0.5 text-xs text-muted-foreground">
-              Updated {formatTimeAgo(lastLiveRefreshAt)}
-            </span>
-          {/if}
-        </div>
-        <p class="mt-1 text-sm text-muted-foreground">{repoName(repo)}</p>
-        <p class="mt-1 text-xs text-muted-foreground">{useSubscriptions ? 'Live updates via Nostr subscriptions' : 'Polling for updates'}</p>
-        {#if repoMetadataError}
-          <p class="mt-1 text-xs text-yellow-400">Repo metadata: {repoMetadataError}</p>
-        {/if}
+    {#if !selectedRunId}
+    <div class="flex flex-col gap-3 sm:flex-row sm:items-center">
+      <div class="relative flex-1">
+        <input
+          class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground"
+          bind:value={searchTerm}
+          type="text"
+          placeholder="Search runs, commits, branches, or actors…" />
       </div>
-
-      <div class="flex flex-wrap items-center gap-2">
-        <button class="inline-flex items-center gap-2 rounded-md border border-input bg-background px-3 py-2 text-sm hover:bg-accent" onclick={() => { void refreshRuns(); void refreshRepoMetadata() }}>
-          <RefreshCw class={`h-4 w-4 ${loading || repoMetadataLoading ? 'animate-spin' : ''}`} />
-          Refresh
+      <div class="flex items-center gap-2">
+        <button class="rounded-md border border-input bg-background px-3 py-2 text-sm hover:bg-accent" onclick={() => (showFilters = !showFilters)}>
+          <Filter class="h-4 w-4" />
         </button>
         <button class="inline-flex items-center gap-2 rounded-md border border-input bg-background px-3 py-2 text-sm hover:bg-accent" onclick={openNewRunForm}>
           <Play class="h-4 w-4" />
@@ -995,21 +971,14 @@
         </button>
       </div>
     </div>
+    {#if repoMetadataError}
+      <p class="text-xs text-yellow-400">Repo metadata: {repoMetadataError}</p>
+    {/if}
+    {/if}
 
-    <div class="grid gap-4 xl:grid-cols-[minmax(0,1fr)_minmax(340px,560px)]">
+    <div class="space-y-4">
+      {#if !selectedRunId}
       <section class="space-y-4">
-        <div class="flex items-center gap-2">
-          <div class="relative flex-1">
-            <input
-              class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground"
-              bind:value={searchTerm}
-              type="text"
-              placeholder="Search runs, commits, branches, or actors…" />
-          </div>
-          <button class="rounded-md border border-input bg-background px-3 py-2 text-sm hover:bg-accent" onclick={() => (showFilters = !showFilters)}>
-            <Filter class="h-4 w-4" />
-          </button>
-        </div>
 
         {#if showFilters}
           <div class="rounded-lg border border-border bg-card p-4">
@@ -1131,8 +1100,8 @@
           </div>
         </div>
       </section>
-
-      <aside class="space-y-4 rounded-lg border border-border bg-card p-4 xl:sticky xl:top-4 xl:self-start">
+      {:else}
+      <aside class="space-y-4 rounded-lg border border-border bg-card p-4">
         {#if detailLoading}
           <div class="flex min-h-[320px] items-center justify-center">
             <RotateCw class="h-8 w-8 animate-spin text-muted-foreground" />
@@ -1149,8 +1118,9 @@
             <div class="flex items-start justify-between gap-3">
               <div>
                 <div class="flex items-center gap-2">
-                  <button class="rounded-md p-1 hover:bg-accent xl:hidden" onclick={closeRun}>
+                  <button class="inline-flex items-center gap-1 rounded-md border border-input bg-background px-2 py-1 text-sm hover:bg-accent" onclick={closeRun}>
                     <ArrowLeft class="h-4 w-4" />
+                    Back
                   </button>
                   <h3 class="text-lg font-semibold">{run.name}</h3>
                 </div>
@@ -1486,6 +1456,7 @@
           </div>
         {/if}
       </aside>
+      {/if}
     </div>
     {/if}
   </div>

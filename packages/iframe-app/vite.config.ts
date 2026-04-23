@@ -7,6 +7,14 @@ export default defineConfig({
     svelte(),
     viteSingleFile(), // Bundle everything into a single HTML file
   ],
+  server: {
+    port: 5173,
+    cors: {
+      origin: true,
+      methods: ['GET', 'HEAD', 'OPTIONS'],
+      allowedHeaders: '*',
+    },
+  },
   build: {
     target: 'es2022',
     outDir: 'dist',

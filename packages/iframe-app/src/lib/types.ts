@@ -7,7 +7,7 @@ export interface RepoContext {
   repo?: {
     repoPubkey: string;
     repoName: string;
-    repoNaddr?: string;
+    repoAddress?: string;
     repoRelays: string[];
     maintainers?: string[];
   };
@@ -18,7 +18,7 @@ export interface RepoContextNormalized {
   userPubkey?: string;
   repoPubkey: string;
   repoName: string;
-  repoNaddr?: string;
+  repoAddress?: string;
   repoRelays: string[];
   maintainers?: string[];
 }
@@ -103,7 +103,7 @@ export interface RepoBranchInfo {
 }
 
 export interface RerunDraft {
-  repoNaddr: string;
+  repoAddress: string;
   workflowPath: string;
   branch: string;
   commit: string;

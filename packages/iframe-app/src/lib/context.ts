@@ -1,4 +1,32 @@
+import { nip19 } from 'nostr-tools';
 import type { RepoContext, RepoContextNormalized } from './types';
+
+/**
+ * Resolve the `kind:pubkey:d-tag` coordinate used in `#a` filters.
+ *
+ * Hosts are expected to provide `repo.address` in coordinate form. If only
+ * a bech32 naddr is available we decode it. Any value that already matches
+ * the coordinate shape is passed through unchanged.
+ */
+function resolveRepoAddress(repo: any): string | undefined {
+  const candidate = repo?.address || repo?.repoAddress;
+  if (typeof candidate === 'string' && candidate.includes(':')) return candidate;
+
+  const naddr = repo?.naddr || repo?.repoNaddr;
+  if (typeof naddr !== 'string') return undefined;
+  if (naddr.includes(':')) return naddr;
+
+  try {
+    const decoded = nip19.decode(naddr);
+    if (decoded.type === 'naddr') {
+      const { kind, pubkey, identifier } = decoded.data;
+      return `${kind}:${pubkey}:${identifier}`;
+    }
+  } catch {
+    // fall through
+  }
+  return undefined;
+}
 
 export function transformHostContext(hostCtx: any): RepoContext {
   const repo = hostCtx?.repo || hostCtx;
@@ -11,7 +39,7 @@ export function transformHostContext(hostCtx: any): RepoContext {
       ? {
           repoPubkey: repo?.pubkey || repo?.repoPubkey || '',
           repoName: repo?.name || repo?.repoName || '',
-          repoNaddr: repo?.naddr || repo?.repoNaddr,
+          repoAddress: resolveRepoAddress(repo),
           repoRelays: repo?.relays || repo?.repoRelays || [],
           maintainers: repo?.maintainers || [],
         }
@@ -22,7 +50,7 @@ export function transformHostContext(hostCtx: any): RepoContext {
     inputKeys: Object.keys(hostCtx || {}),
     repoPubkey: result.repo?.repoPubkey?.slice(0, 12),
     repoName: result.repo?.repoName,
-    repoNaddr: result.repo?.repoNaddr?.slice(0, 30),
+    repoAddress: result.repo?.repoAddress,
     relayCount: result.repo?.repoRelays?.length,
   });
 
@@ -48,7 +76,7 @@ export function normalizeRepo(ctx: RepoContext | null): RepoContextNormalized | 
     userPubkey: ctx?.userPubkey,
     repoPubkey: repo.repoPubkey,
     repoName: repo.repoName,
-    repoNaddr: repo.repoNaddr,
+    repoAddress: repo.repoAddress,
     repoRelays,
     maintainers: Array.isArray(repo.maintainers) ? repo.maintainers : undefined,
   };
