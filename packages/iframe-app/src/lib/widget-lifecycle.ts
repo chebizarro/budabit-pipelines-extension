@@ -1,11 +1,10 @@
 import { createWidgetBridge, type WidgetBridge } from '@flotilla/ext-shared';
-import { getHostOrigin, normalizeRepo, transformHostContext } from './context';
+import { getHostOrigin, transformHostContext } from './context';
 import type { RepoContext } from './types';
 
 interface WidgetLifecycleArgs {
   onBridgeChange: (bridge: WidgetBridge | null) => void;
   onRepoContextChange: (repoContext: RepoContext | null) => void;
-  onRefreshRuns: (repo?: ReturnType<typeof normalizeRepo> | null) => void | Promise<void>;
   onRepoChange: () => void;
   onUnmount: () => void;
 }
@@ -29,7 +28,7 @@ async function fetchRepoContext(bridge: WidgetBridge): Promise<unknown | null> {
 }
 
 export function setupWidgetLifecycle(args: WidgetLifecycleArgs) {
-  const { onBridgeChange, onRepoContextChange, onRefreshRuns, onRepoChange, onUnmount } = args;
+  const { onBridgeChange, onRepoContextChange, onRepoChange, onUnmount } = args;
 
   let contextReceived = false;
 
@@ -48,17 +47,12 @@ export function setupWidgetLifecycle(args: WidgetLifecycleArgs) {
     if (options.resetRunState) {
       onRepoChange();
     }
-    void onRefreshRuns(normalizeRepo(nextRepoCtx));
   };
 
   const offInit = bridge.onEvent('widget:init', (payload: any) => {
     if (payload?.repoContext) {
       handleRepoContext(payload.repoContext, { resetRunState: false });
     }
-  });
-
-  const offMounted = bridge.onEvent('widget:mounted', () => {
-    void onRefreshRuns();
   });
 
   const offUnmounting = bridge.onEvent('widget:unmounting', () => {
@@ -88,7 +82,6 @@ export function setupWidgetLifecycle(args: WidgetLifecycleArgs) {
   return () => {
     clearTimeout(fallbackTimer);
     offInit();
-    offMounted();
     offUnmounting();
     offContext();
     offRepoUpdate();

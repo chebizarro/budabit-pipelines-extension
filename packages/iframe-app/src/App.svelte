@@ -53,7 +53,7 @@
   import WorkflowLogs from './lib/components/WorkflowLogs.svelte'
   import ReleaseSigningView from './lib/components/ReleaseSigningView.svelte'
   import UserDisplay from './lib/components/UserDisplay.svelte'
-  import {loadRunDetailController, refreshRunsController} from './lib/controllers'
+  import {loadRunDetailController} from './lib/controllers'
   import {
     createSubmissionResetState,
     prepareNewRunSubmissionState,
@@ -64,10 +64,9 @@
     createDetailSessionErrorState,
     createOpenedDetailSessionState,
     createOpeningDetailSessionState,
-    reconcileSelectedRunState,
   } from './lib/detail-session'
   import {setupWidgetLifecycle} from './lib/widget-lifecycle'
-  import {attachSubscriptionListener, subscribe, unsubscribe, unsubscribeAll} from './lib/subscriptions'
+  import {repoEvents} from './lib/nostr'
   import {
     generatePaymentTokenViewModel,
     refreshWalletViewModel,
@@ -81,7 +80,6 @@
   import type {
     RepoBranchInfo,
     RepoContext,
-    RepoContextNormalized,
     RerunDraft,
     LoomWorker,
     WorkflowDefinition,
@@ -158,16 +156,12 @@
 
   let currentView = $state<'pipelines' | 'releases'>('pipelines')
 
-  let loadSeq = 0
   let detailSeq = 0
 
   const ACTIVE_RUN_STATUSES = ['pending', 'queued', 'running', 'in_progress'] as const
   const FALLBACK_RELAYS = ['wss://relay.sharegap.net', 'wss://nos.lol']
 
-  let runListSubId = $state<string | null>(null)
-  let runDetailSubId = $state<string | null>(null)
   let liveDurationSeconds = $state<number | null>(null)
-  let subListenerCleanup: (() => void) | null = null
 
   const selectedWorker = $derived(getSelectedWorker(rerunDraft, discoveredWorkers))
   const compatibleMints = $derived.by(() => getCompatibleMints(selectedWorker, walletMints))
@@ -248,44 +242,6 @@
     detailRefreshing = false
     if (!nextState.selectedRunDetail) {
       resetDetailArtifacts()
-    }
-  }
-
-  async function refreshRuns(nextRepo: RepoContextNormalized | null = repo, background = false) {
-    if (!bridge || !nextRepo) {
-      console.log('[pipelines] refreshRuns skipped: bridge=', !!bridge, 'nextRepo=', !!nextRepo)
-      return
-    }
-    console.log('[pipelines] refreshRuns: repo=', nextRepo.repoName, 'naddr=', nextRepo.repoNaddr?.slice(0, 30), 'relays=', nextRepo.repoRelays)
-
-    const seq = ++loadSeq
-    if (!background) {
-      loading = true
-      error = null
-    }
-
-    try {
-      const nextRuns = await refreshRunsController(bridge, nextRepo)
-      if (seq !== loadSeq) return
-      workflowRuns = nextRuns
-      const nextSelection = reconcileSelectedRunState({
-        workflowRuns: nextRuns,
-        selectedRunId,
-        selectedRunDetail,
-      })
-      selectedRunId = nextSelection.selectedRunId
-      selectedRunDetail = nextSelection.selectedRunDetail
-      if (background) {
-      }
-    } catch (err) {
-      if (seq !== loadSeq) return
-      if (!background) {
-        error = friendlyErrorMessage(err instanceof Error ? err.message : String(err))
-      } else {
-        console.warn('[pipelines] background refreshRuns failed', err)
-      }
-    } finally {
-      if (seq === loadSeq && !background) loading = false
     }
   }
 
@@ -570,7 +526,6 @@
       })
 
       applySubmissionReset()
-      workflowRuns = nextState.workflowRuns
       applyDetailSessionState(nextState.detailSessionState)
 
       await showToast(`${submissionMode === 'new' ? 'Run' : 'Rerun'} submitted: ${nextState.runId.slice(0, 8)}`, 'success')
@@ -619,101 +574,26 @@
     void refreshRepoMetadata()
   })
 
-  // Initial load + persistent subscription for run events
+  // Layered stream of repo pipeline events → merged into local state.
+  // Secondary subscriptions (worker + publisher events) are derived from
+  // trusted primary events, so untrusted pubkeys can't inject results.
   $effect(() => {
-    if (!bridge || !repo) return
+    if (!repo?.repoAddress) return
 
-    const currentBridge = bridge
-    const currentRepo = repo
-
-    // One-time initial load from relays
-    void refreshRuns(currentRepo)
-
-    // Open a persistent subscription — events are merged directly into state
-    let subId: string | null = null
-    const relays = [...new Set([...currentRepo.repoRelays, ...FALLBACK_RELAYS])]
-
-    if (currentRepo.repoAddress) {
-      void subscribe(currentBridge, relays, {
-        kinds: [5401, 5100, 5402, 5101, 30100],
-        '#a': [currentRepo.repoAddress],
-        since: Math.floor(Date.now() / 1000) - 60,
-      }, (event) => {
-        // Merge the incoming event directly into the run list
-        workflowRuns = mergeEventIntoRuns(workflowRuns, event, currentRepo.repoAddress)
-
-        // Also update the selected detail if it matches
-        const detail = selectedRunDetail
-        if (detail) {
-          const updated = mergeEventIntoDetail(detail, event)
-          if (updated !== detail) {
-            selectedRunDetail = updated
-          }
-        }
-      }).then(id => {
-        subId = id
-        if (id) {
-          runListSubId = id
-        }
-      })
-    }
-
-    return () => {
-      if (subId) {
-        runListSubId = null
-        void unsubscribe(currentBridge, subId)
-      }
-    }
-  })
-
-  // Subscribe to detail-level events for the selected active run
-  // Events are merged directly into selectedRunDetail by the run list subscription above.
-  // This subscription adds a narrower #e filter to catch events that reference the run/job
-  // by id but don't carry the repo #a tag.
-  $effect(() => {
-    if (!selectedRunId || !bridge || !repo) return
-
-    const detail = untrack(() => selectedRunDetail)
-    if (!detail || !isActiveRunStatus(detail.run.status)) return
-
-    const currentBridge = bridge
-    const currentRunId = selectedRunId
-    const loomJobId = detail.run.loomJobEvent?.id
-
-    const eTags = [currentRunId]
-    if (loomJobId) eTags.push(loomJobId)
-
+    const repoAddress = repo.repoAddress
     const relays = [...new Set([...repo.repoRelays, ...FALLBACK_RELAYS])]
+    const trustedAuthors = [...new Set([repo.repoPubkey, ...(repo.maintainers ?? [])])]
 
-    let subId: string | null = null
-    void subscribe(currentBridge, relays, {
-      kinds: [5402, 5101, 30100],
-      '#e': eTags,
-      since: Math.floor(Date.now() / 1000) - 60,
-    }, (event) => {
-      // Merge into the detail
-      const currentDetail = selectedRunDetail
-      if (currentDetail) {
-        const updated = mergeEventIntoDetail(currentDetail, event)
-        if (updated !== currentDetail) {
-          selectedRunDetail = updated
-        }
-      }
-      // Also update the run in the list
-      workflowRuns = mergeEventIntoRuns(workflowRuns, event)
-    }).then(id => {
-      subId = id
-      if (id) {
-        runDetailSubId = id
+    const sub = repoEvents(repoAddress, relays, trustedAuthors).subscribe(event => {
+      workflowRuns = mergeEventIntoRuns(workflowRuns, event, repoAddress)
+      const detail = selectedRunDetail
+      if (detail) {
+        const updated = mergeEventIntoDetail(detail, event)
+        if (updated !== detail) selectedRunDetail = updated
       }
     })
 
-    return () => {
-      if (subId) {
-        runDetailSubId = null
-        void unsubscribe(currentBridge, subId)
-      }
-    }
+    return () => sub.unsubscribe()
   })
 
   // Live duration counter for active runs
@@ -884,41 +764,21 @@
   $effect(() => {
     return setupWidgetLifecycle({
       onBridgeChange: nextBridge => {
-        // Clean up old subscriptions
-        // IMPORTANT: use untrack() to avoid reading 'bridge' as a tracked dependency
-        // — setupWidgetLifecycle calls this callback synchronously, which would make
-        // this effect depend on 'bridge', creating an infinite read→write→re-trigger cycle
-        const oldBridge = untrack(() => bridge)
-        if (oldBridge) {
-          unsubscribeAll(oldBridge)
-          subListenerCleanup = null
-        }
         bridge = nextBridge
-        // Attach subscription listener for the new bridge
-        if (nextBridge) {
-          subListenerCleanup = attachSubscriptionListener(nextBridge)
-        }
       },
       onRepoContextChange: nextRepoCtx => {
         repoCtx = nextRepoCtx
       },
-      onRefreshRuns: nextRepo => refreshRuns(nextRepo ?? repo),
       onRepoChange: () => {
         closeRun()
         repoWorkflows = []
         repoBranches = []
       },
       onUnmount: () => {
-        loadSeq += 1
         detailSeq += 1
         workflowRuns = []
         repoWorkflows = []
         repoBranches = []
-        const currentBridge = untrack(() => bridge)
-        if (currentBridge) {
-          unsubscribeAll(currentBridge)
-          subListenerCleanup = null
-        }
         closeRun()
       },
     })
