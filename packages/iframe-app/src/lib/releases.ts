@@ -1,6 +1,6 @@
 import type { WidgetBridge } from '@flotilla/ext-shared';
 import type { NostrEvent, RepoContextNormalized } from './types';
-import { queryEvents, eventTagValue } from './pipelines';
+import { queryEvents, eventTagValue } from './workflows';
 
 const FALLBACK_RELAYS = ['wss://relay.sharegap.net', 'wss://nos.lol'];
 

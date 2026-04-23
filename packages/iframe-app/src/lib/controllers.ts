@@ -1,6 +1,6 @@
 import type { WidgetBridge } from '@flotilla/ext-shared'
 import { buildInlineRunnerArgs } from './runner-script'
-import { loadWorkflowRunDetail, loadWorkers } from './pipelines'
+import { loadWorkflowRunDetail, loadWorkers } from './workflows'
 import { createCashuPaymentToken, loadCashuWalletState } from './wallet'
 import { submitRerun } from './nip07'
 import type { LoomWorker, RepoContextNormalized, RerunDraft, WorkflowRunDetail } from './types'

@@ -26,10 +26,9 @@
     eventTagValue,
     externalUrlForEvent,
     mergeEventIntoDetail,
-    mergeEventIntoRuns,
     publicLinkForRun,
     statusLabel,
-  } from './lib/pipelines'
+  } from './lib/workflows'
   import {
     buildAutoTokenCandidateKey,
     formatDuration,
@@ -66,7 +65,7 @@
     createOpeningDetailSessionState,
   } from './lib/detail-session'
   import {setupWidgetLifecycle} from './lib/widget-lifecycle'
-  import {repoEvents} from './lib/nostr'
+  import {repoEvents$, repoRuns$} from './lib/workflows'
   import {
     generatePaymentTokenViewModel,
     refreshWalletViewModel,
@@ -574,9 +573,9 @@
     void refreshRepoMetadata()
   })
 
-  // Layered stream of repo pipeline events → merged into local state.
-  // Secondary subscriptions (worker + publisher events) are derived from
-  // trusted primary events, so untrusted pubkeys can't inject results.
+  // Runs list comes from a module-scoped BehaviorSubject keyed by repoAddress.
+  // On HMR the subject persists, so remounted subscribers get the current list
+  // immediately instead of starting empty.
   $effect(() => {
     if (!repo?.repoAddress) return
 
@@ -584,16 +583,22 @@
     const relays = [...new Set([...repo.repoRelays, ...FALLBACK_RELAYS])]
     const trustedAuthors = [...new Set([repo.repoPubkey, ...(repo.maintainers ?? [])])]
 
-    const sub = repoEvents(repoAddress, relays, trustedAuthors).subscribe(event => {
-      workflowRuns = mergeEventIntoRuns(workflowRuns, event, repoAddress)
-      const detail = selectedRunDetail
-      if (detail) {
-        const updated = mergeEventIntoDetail(detail, event)
-        if (updated !== detail) selectedRunDetail = updated
-      }
+    const runsSub = repoRuns$(repoAddress, relays, trustedAuthors).subscribe(runs => {
+      workflowRuns = runs
     })
 
-    return () => sub.unsubscribe()
+    // Detail merging still needs the raw event stream.
+    const detailSub = repoEvents$(repoAddress, relays, trustedAuthors).subscribe(event => {
+      const detail = selectedRunDetail
+      if (!detail) return
+      const updated = mergeEventIntoDetail(detail, event)
+      if (updated !== detail) selectedRunDetail = updated
+    })
+
+    return () => {
+      runsSub.unsubscribe()
+      detailSub.unsubscribe()
+    }
   })
 
   // Live duration counter for active runs

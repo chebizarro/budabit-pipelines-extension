@@ -9,8 +9,38 @@ import type {
   WorkflowStatus,
 } from './types';
 import { toRepoNostrUrl } from './nip07';
+import { eventStore, pool } from './nostr';
+import { onlyEvents } from 'applesauce-relay';
+import {
+  BehaviorSubject,
+  EMPTY,
+  combineLatest,
+  distinctUntilChanged,
+  filter,
+  map,
+  merge,
+  scan,
+  shareReplay,
+  switchMap,
+  tap,
+  type Observable,
+} from 'rxjs';
 
 const FALLBACK_RELAYS = ['wss://relay.sharegap.net', 'wss://nos.lol'];
+
+/** Hive CI event kinds. */
+export const KIND_WORKFLOW_RUN = 5401;
+export const KIND_WORKFLOW_RESULT = 5402;
+export const KIND_LOOM_JOB = 5100;
+export const KIND_LOOM_RESULT = 5101;
+export const KIND_LOOM_STATUS = 30100;
+export const KIND_LOOM_WORKER = 10100;
+
+function setsEqual<T>(a: Set<T>, b: Set<T>): boolean {
+  if (a.size !== b.size) return false;
+  for (const v of a) if (!b.has(v)) return false;
+  return true;
+}
 
 function dedupe(values: string[]): string[] {
   return Array.from(
@@ -601,4 +631,156 @@ function updateRunByERefs(
     return updater(run);
   });
   return changed ? next : runs;
+}
+
+// ── Live streams ───────────────────────────────────────────────────
+
+/**
+ * Layered event stream for a repo's pipelines view.
+ *
+ * Untrusted identities can't spam us with bogus status/result events — every
+ * secondary subscription is keyed on pubkeys or ids that have already appeared
+ * in a trust-gated primary event.
+ *
+ * - **Primary**: workflow runs + loom jobs authored by maintainers, scoped to
+ *   the repo's `#a`.
+ * - **Worker layer**: loom status/result/worker-profile events authored by any
+ *   worker pubkey observed as the `p` tag on a layer-1 loom job — scoped to
+ *   the known job ids.
+ * - **Publisher layer**: kind-5402 events authored by any pubkey observed as
+ *   the `publisher` tag on a layer-1 workflow run — scoped to the known run
+ *   ids.
+ */
+function buildRepoEvents(
+  repoAddress: string,
+  relays: string[],
+  trustedAuthors: string[],
+): Observable<NostrEvent> {
+  const authors = [...new Set(trustedAuthors)];
+  if (authors.length === 0) return EMPTY;
+
+  const primary$ = pool
+    .subscription(relays, {
+      kinds: [KIND_WORKFLOW_RUN, KIND_LOOM_JOB],
+      '#a': [repoAddress],
+      authors,
+    })
+    .pipe(onlyEvents(), shareReplay({bufferSize: Infinity, refCount: true}));
+
+  const accumulateToSet = <T>(values$: Observable<T>) =>
+    values$.pipe(
+      scan((set, v) => (set.has(v) ? set : new Set(set).add(v)), new Set<T>()),
+      distinctUntilChanged(setsEqual),
+    );
+
+  const workers$ = accumulateToSet(
+    primary$.pipe(
+      filter(e => e.kind === KIND_LOOM_JOB),
+      map(e => eventTagValue(e, 'p')),
+      filter((pk): pk is string => !!pk),
+    ),
+  );
+
+  const jobIds$ = accumulateToSet(
+    primary$.pipe(
+      filter(e => e.kind === KIND_LOOM_JOB),
+      map(e => e.id),
+    ),
+  );
+
+  const publishers$ = accumulateToSet(
+    primary$.pipe(
+      filter(e => e.kind === KIND_WORKFLOW_RUN),
+      map(e => eventTagValue(e, 'publisher')),
+      filter((pk): pk is string => !!pk),
+    ),
+  );
+
+  const runIds$ = accumulateToSet(
+    primary$.pipe(
+      filter(e => e.kind === KIND_WORKFLOW_RUN),
+      map(e => e.id),
+    ),
+  );
+
+  const workerEvents$ = combineLatest([workers$, jobIds$]).pipe(
+    switchMap(([workers, jobIds]) => {
+      if (!workers.size || !jobIds.size) return EMPTY;
+      return pool
+        .subscription(relays, {
+          kinds: [KIND_LOOM_RESULT, KIND_LOOM_STATUS],
+          authors: [...workers],
+          '#e': [...jobIds],
+        })
+        .pipe(onlyEvents());
+    }),
+  );
+
+  const workerInfo$ = workers$.pipe(
+    switchMap(workers => {
+      if (!workers.size) return EMPTY;
+      return pool
+        .subscription(relays, {
+          kinds: [KIND_LOOM_WORKER],
+          authors: [...workers],
+        })
+        .pipe(onlyEvents());
+    }),
+  );
+
+  const workflowResults$ = combineLatest([publishers$, runIds$]).pipe(
+    switchMap(([publishers, runIds]) => {
+      if (!publishers.size || !runIds.size) return EMPTY;
+      return pool
+        .subscription(relays, {
+          kinds: [KIND_WORKFLOW_RESULT],
+          authors: [...publishers],
+          '#e': [...runIds],
+        })
+        .pipe(onlyEvents());
+    }),
+  );
+
+  return merge(primary$, workerEvents$, workerInfo$, workflowResults$);
+}
+
+// Module-scoped caches keyed on repoAddress. Survive component HMR so
+// remounted subscribers get the current state immediately.
+const repoEventsCache = new Map<string, Observable<NostrEvent>>();
+const repoRunsCache = new Map<string, BehaviorSubject<WorkflowRun[]>>();
+
+/** Cached, shared event stream for a repo. Replays all past events to late subscribers. */
+export function repoEvents$(
+  repoAddress: string,
+  relays: string[],
+  trustedAuthors: string[],
+): Observable<NostrEvent> {
+  const existing = repoEventsCache.get(repoAddress);
+  if (existing) return existing;
+
+  const shared = buildRepoEvents(repoAddress, relays, trustedAuthors).pipe(
+    tap(event => eventStore.add(event as Parameters<typeof eventStore.add>[0])),
+    shareReplay({bufferSize: Infinity, refCount: false}),
+  );
+  // Keep the upstream alive even without subscribers so events keep accruing.
+  shared.subscribe();
+  repoEventsCache.set(repoAddress, shared);
+  return shared;
+}
+
+/** Cached folded runs list. BehaviorSubject — emits current array on subscribe. */
+export function repoRuns$(
+  repoAddress: string,
+  relays: string[],
+  trustedAuthors: string[],
+): Observable<WorkflowRun[]> {
+  const existing = repoRunsCache.get(repoAddress);
+  if (existing) return existing;
+
+  const subject = new BehaviorSubject<WorkflowRun[]>([]);
+  repoEvents$(repoAddress, relays, trustedAuthors).subscribe(event => {
+    subject.next(mergeEventIntoRuns(subject.value, event, repoAddress));
+  });
+  repoRunsCache.set(repoAddress, subject);
+  return subject;
 }
