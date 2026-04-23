@@ -1,6 +1,6 @@
 # Budabit CI/CD Pipelines Extension
 
-A Flotilla Smart Widget extension that provides a full CI/CD pipeline management interface for Nostr-native Git repositories. Users can view workflow run history, inspect live job status, and trigger new runs — all powered by Nostr events and the Loom compute protocol.
+A Flotilla Smart Widget extension that provides a full CI/CD pipeline management interface and release-signing workflow for Nostr-native Git repositories. Users can view workflow run history, inspect live job status, trigger new runs, and co-sign release artifacts — all powered by Nostr events and the Loom compute protocol.
 
 ## How It Works
 
@@ -20,6 +20,7 @@ The pipelines extension is built entirely on Nostr events. There is no central C
 │  4. Sees updates    │◀──────│  30100 status    │       │     30100 status│
 │     in real time    │       │  5402 wf result  │       │     5402 result │
 │     via WebSocket   │       │  5101 loom result│       │     5101 result │
+│                     │       │  1063 artifacts  │       │     1063 release│
 └─────────────────────┘       └─────────────────┘       └─────────────────┘
 ```
 
@@ -27,12 +28,14 @@ The pipelines extension is built entirely on Nostr events. There is no central C
 
 | Kind | Name | Direction | Purpose |
 |------|------|-----------|---------|
-| **5401** | Workflow Run | User → Relay | Declares a new CI run. Contains repo address (`#a`), workflow path, branch, commit, and triggering pubkey. |
+| **5401** | Workflow Run | User → Relay | Declares a new CI run. Contains repo address (`#a`), workflow path, branch, commit, and triggering pubkey. Links to an ephemeral publisher key. |
 | **5100** | Loom Job | User → Relay → Worker | Dispatches a compute job to a specific worker. References the 5401 run via `#e` tag. Contains the command, args, env vars, encrypted secrets, and a Cashu payment token. |
 | **5402** | Workflow Result | Worker → Relay → User | Published by the runner script after `act` completes. Contains status (success/failed), duration, exit code, and a Blossom URL to the full act log. |
 | **5101** | Loom Result | Worker → Relay → User | The Loom worker's own result event. Contains exit code, stdout/stderr Blossom URLs, and optionally a Cashu change token (refund for unused compute time). |
 | **30100** | Loom Status | Worker → Relay → User | Replaceable status updates from the worker during execution (e.g., `queued`, `running`, `success`). |
 | **10100** | Worker Advertisement | Worker → Relay | Workers advertise themselves with name, architecture, pricing, supported mints, and queue depth. The extension queries these to populate the worker picker. |
+| **1063** | File Metadata (NIP-94) | Worker → Relay | Release artifacts with SHA-256 hashes. Used by the release-signing feature to verify artifact consensus across workers. |
+| **30000** | People List (NIP-51) | User → Relay | Used to resolve trusted maintainer lists for release signing. |
 
 ### Event Chain
 
@@ -48,6 +51,29 @@ When a user triggers a run, the extension creates two events in sequence:
    - `['secret', key, encryptedValue]` tags — NIP-44 encrypted secrets (the ephemeral nsec, user-provided secrets)
 
 The worker picks up the 5100 event, executes the command, and publishes status/result events back to the same relays.
+
+### Release Signing Trust Chain
+
+The release-signing feature establishes a trust chain from maintainers to build artifacts:
+
+```
+Maintainer (trusted pubkey)
+  └── Kind 5401: links maintainer to ephemeral publisher key
+        └── Kind 5100: links run to worker via p-tag
+              └── Kind 10100: worker identity (name, architecture)
+              └── Kind 1063: artifact with SHA-256 hash (published by ephemeral key)
+```
+
+The extension uses a two-phase data loading approach:
+1. Fetch kind 5401 workflow runs → extract trusted ephemeral publisher keys
+2. Fetch kind 1063 artifacts from those publisher keys
+
+Artifacts are grouped by configurable tags (e.g., `filename`) and SHA-256 hashes are compared across workers. Consensus is classified as:
+- **Unanimous** — all workers agree on the same hash
+- **Majority** — more than half agree
+- **Split** — no majority
+
+Maintainers can then select artifacts and co-sign them via the host's event signer (`nostr:sign` bridge action), publishing their attestations to relays.
 
 ### Worker Discovery
 
@@ -108,13 +134,18 @@ The extension runs as an iframe and communicates with Flotilla via the **Widget 
 | Bridge Action | Purpose |
 |--------------|---------|
 | `nostr:query` | Fetch existing events from relays |
-| `nostr:publish` | Sign unsigned events with the host's signer and publish to relays. Returns the signed event's `id`. |
+| `nostr:publish` | Sign unsigned events with the host's signer and publish to relays. Also publishes pre-signed events. Returns the signed event's `id`. |
+| `nostr:sign` | Sign an event without publishing it. Used for release co-signing where the extension controls when to publish. Returns the full signed event. |
 | `nostr:subscribe` | Open persistent WebSocket subscriptions. Events stream back via `nostr:subscription:event` bridge events. |
+| `nostr:unsubscribe` | Close a previously opened subscription. |
 | `nostr:nip44Encrypt` | Encrypt plaintext to a recipient pubkey using the host's NIP-44 signer. |
 | `context:getRepo` | Fetch repository context (pubkey, name, naddr, relays). |
 | `repo:listWorkflows` | List `.github/workflows/*.yml` files from the git repo. |
 | `repo:getBranches` | Get branch list and default branch. |
-| `storage:get/set` | Persist extension state (repo-scoped). |
+| `storage:get/set/remove/keys` | Persist extension state (repo-scoped or global). |
+| `cashu:getBalance` | Query the user's Cashu wallet balance (total and per-mint). |
+| `cashu:getMints` | List the user's configured Cashu mints. |
+| `cashu:createToken` | Generate a Cashu token from the user's wallet for a given amount and mint. |
 | `ui:toast` | Show toast notifications in the host UI. |
 
 The user's pubkey is provided by the host via `context:update` / `widget:init` events. The extension never uses `window.nostr` or NIP-07 directly — all signing is handled transparently by the host.
@@ -124,13 +155,17 @@ The user's pubkey is provided by the host via `context:update` / `widget:init` e
 The widget's kind 30033 manifest declares these permissions:
 
 ```
-nostr:publish, nostr:query, nostr:subscribe, nostr:nip44Encrypt, ui:toast
+nostr:publish, nostr:query, nostr:sign, nostr:nip44Encrypt, nostr:subscribe, nostr:unsubscribe,
+ui:toast, storage:get, storage:set, storage:remove, storage:keys,
+context:getRepo, repo:listWorkflows, repo:getBranches,
+cashu:getBalance, cashu:getMints, cashu:createToken
 ```
 
 Flotilla enforces these — bridge requests for undeclared actions are rejected.
 
 ## Features
 
+### Pipelines Tab
 - **View workflow runs** — Browse all pipeline executions with status indicators, duration, and branch info
 - **Real-time status** — Live updates via Nostr WebSocket subscriptions, no polling
 - **Inspect run details** — Full event chain (run → job → status → result), parsed act logs, stdout/stderr
@@ -139,6 +174,14 @@ Flotilla enforces these — bridge requests for undeclared actions are rejected.
 - **Worker discovery** — Live worker advertisements with pricing, queue depth, and mint compatibility
 - **Cashu payments** — Wallet-aware mint selection, auto-token generation prompts
 - **Search and filter** — Find runs by name, status, branch, commit, or actor
+
+### Releases Tab
+- **Load release artifacts** — Two-phase data loading via trusted maintainer → ephemeral key → NIP-94 artifacts
+- **Consensus verification** — Artifacts grouped by configurable tags, SHA-256 hash comparison across workers (unanimous / majority / split)
+- **Trust flow visualization** — Sankey-style SVG diagram showing Maintainers → Workers → Signing Keys → Hashes
+- **NIP-51 list resolution** — Resolve trusted maintainer lists from NIP-51 people list events
+- **Co-sign releases** — Select artifacts and sign attestations via the host's event signer, then publish to relays
+- **Auto-seed maintainers** — Automatically populates trusted maintainers from the repository's maintainer list
 
 ## Quick Start
 
@@ -178,9 +221,11 @@ budabit-pipelines-extension/
 │   ├── shared/          # Framework-agnostic bridge types + signaling helpers
 │   ├── iframe-app/      # Svelte 5 iframe app (the actual widget UI)
 │   │   └── src/
-│   │       ├── App.svelte           # Main component: run list, detail panel, submission forms
+│   │       ├── App.svelte           # Main component: tab switcher (Pipelines / Releases),
+│   │       │                        #   run list, detail panel, submission forms
 │   │       └── lib/
 │   │           ├── pipelines.ts     # Nostr event querying, parsing, and real-time merge logic
+│   │           ├── releases.ts      # Release artifact loading, grouping, consensus, signing
 │   │           ├── nip07.ts         # Event construction, bridge-delegated signing + encryption
 │   │           ├── subscriptions.ts # Persistent Nostr WebSocket subscriptions via bridge
 │   │           ├── controllers.ts   # Orchestrates bridge calls for each user action
@@ -198,7 +243,13 @@ budabit-pipelines-extension/
 │   │           ├── wallet-prompt.ts # Auto-token generation prompt logic
 │   │           ├── cicd.ts          # YAML workflow parser, act log parser
 │   │           ├── repo.ts          # Repo metadata loading (workflows, branches)
-│   │           └── components/      # Svelte sub-components
+│   │           └── components/
+│   │               ├── ReleaseSigningView.svelte  # Release signing UI (maintainers, groups, sign)
+│   │               ├── ReleaseSankey.svelte        # SVG trust flow visualization
+│   │               ├── RunSubmissionForm.svelte    # Run submission form
+│   │               ├── WorkflowJobs.svelte         # Horizontal YAML job flow diagram
+│   │               ├── WorkflowLogs.svelte         # Matrix job grouping with step logs
+│   │               └── ConsoleOutput.svelte        # Collapsible console log viewer
 │   ├── manifest/        # CLI: generates kind 30033 + widget.json
 │   ├── worker/          # Worker bridge stub
 │   └── test-utils/      # Bridge mocks for testing
