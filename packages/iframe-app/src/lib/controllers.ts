@@ -1,16 +1,9 @@
 import type { WidgetBridge } from '@flotilla/ext-shared'
 import { buildInlineRunnerArgs } from './runner-script'
-import { loadWorkflowRunDetail, loadWorkflowRuns, loadWorkers } from './pipelines'
+import { loadWorkflowRunDetail, loadWorkers } from './workflows'
 import { createCashuPaymentToken, loadCashuWalletState } from './wallet'
 import { submitRerun } from './nip07'
-import type { LoomWorker, RepoContextNormalized, RerunDraft, WorkflowRun, WorkflowRunDetail } from './types'
-
-export async function refreshRunsController(
-  bridge: WidgetBridge,
-  repo: RepoContextNormalized
-): Promise<WorkflowRun[]> {
-  return loadWorkflowRuns(bridge, repo)
-}
+import type { LoomWorker, RepoContextNormalized, RerunDraft, WorkflowRunDetail } from './types'
 
 export async function loadRunDetailController(
   bridge: WidgetBridge,

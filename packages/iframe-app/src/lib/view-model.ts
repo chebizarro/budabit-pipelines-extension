@@ -2,7 +2,6 @@ import type { WidgetBridge } from '@flotilla/ext-shared';
 import {
   generatePaymentTokenController,
   loadRunDetailController,
-  refreshRunsController,
   refreshWalletController,
   refreshWorkersController,
   submitRunController,
@@ -104,18 +103,15 @@ export async function submitRunViewModel(args: {
     rerunSecrets: args.rerunSecrets,
   });
 
-  const workflowRuns = await refreshRunsController(args.bridge, args.repo);
-  const nextRun = workflowRuns.find((run) => run.id === runId);
-
+  // The run-list subscription will pick up the new run; open the detail directly.
   let detailSessionState: DetailSessionState = createClosedDetailSessionState();
-  if (nextRun) {
-    const detail = await loadRunDetailController(args.bridge, args.repo, nextRun.id);
+  if (runId) {
+    const detail = await loadRunDetailController(args.bridge, args.repo, runId);
     detailSessionState = createOpenedDetailSessionState(detail);
   }
 
   return {
     runId,
-    workflowRuns,
     detailSessionState,
   };
 }

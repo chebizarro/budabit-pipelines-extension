@@ -4,19 +4,12 @@
   import {
     AlertCircle,
     ArrowLeft,
-    ChevronRight,
-    Clock,
     Copy,
     ExternalLink,
     FileCheck,
-    Filter,
-    GitBranch,
-    GitCommit,
     Play,
-    RefreshCw,
     RotateCw,
     SearchX,
-    Server,
     Terminal,
   } from '@lucide/svelte'
   import {friendlyErrorMessage, normalizeRepo} from './lib/context'
@@ -26,10 +19,9 @@
     eventTagValue,
     externalUrlForEvent,
     mergeEventIntoDetail,
-    mergeEventIntoRuns,
     publicLinkForRun,
     statusLabel,
-  } from './lib/pipelines'
+  } from './lib/workflows'
   import {
     buildAutoTokenCandidateKey,
     formatDuration,
@@ -53,7 +45,13 @@
   import WorkflowLogs from './lib/components/WorkflowLogs.svelte'
   import ReleaseSigningView from './lib/components/ReleaseSigningView.svelte'
   import UserDisplay from './lib/components/UserDisplay.svelte'
-  import {loadRunDetailController, refreshRunsController} from './lib/controllers'
+  import FilterDropdown from './lib/components/FilterDropdown.svelte'
+  import RunListItem from './lib/components/RunListItem.svelte'
+  import RunDetailSidebar from './lib/components/RunDetailSidebar.svelte'
+  import RunActionsMenu from './lib/components/RunActionsMenu.svelte'
+  import {getProfileContent} from 'applesauce-core/helpers/profile'
+  import {eventStore} from './lib/nostr'
+  import {loadRunDetailController} from './lib/controllers'
   import {
     createSubmissionResetState,
     prepareNewRunSubmissionState,
@@ -64,10 +62,9 @@
     createDetailSessionErrorState,
     createOpenedDetailSessionState,
     createOpeningDetailSessionState,
-    reconcileSelectedRunState,
   } from './lib/detail-session'
   import {setupWidgetLifecycle} from './lib/widget-lifecycle'
-  import {attachSubscriptionListener, subscribe, unsubscribe, unsubscribeAll} from './lib/subscriptions'
+  import {repoEvents$, repoRuns$} from './lib/workflows'
   import {
     generatePaymentTokenViewModel,
     refreshWalletViewModel,
@@ -81,7 +78,6 @@
   import type {
     RepoBranchInfo,
     RepoContext,
-    RepoContextNormalized,
     RerunDraft,
     LoomWorker,
     WorkflowDefinition,
@@ -152,22 +148,29 @@
   let changeAmount = $state<number | null>(null)
 
   let searchTerm = $state('')
-  let statusFilter = $state<string>('all')
-  let showFilters = $state(false)
+  let workflowFilter = $state<Set<string>>(new Set())
+  let triggerFilter = $state<Set<string>>(new Set())
+  let statusFilter = $state<Set<string>>(new Set())
+  let branchFilter = $state<Set<string>>(new Set())
+  let actorFilter = $state<Set<string>>(new Set())
+  let showStalePending = $state(false)
   let showRawEvents = $state(false)
+  let currentDetailView = $state<'hiveci' | 'loom'>('hiveci')
+
+  const STALE_PENDING_MS = 72 * 60 * 60 * 1000
+
+  // Bump on every event store insert so profile-name lookups used in the
+  // filtered-runs derivation recompute when a kind-0 loads.
+  let profileTick = $state(0)
 
   let currentView = $state<'pipelines' | 'releases'>('pipelines')
 
-  let loadSeq = 0
   let detailSeq = 0
 
   const ACTIVE_RUN_STATUSES = ['pending', 'queued', 'running', 'in_progress'] as const
   const FALLBACK_RELAYS = ['wss://relay.sharegap.net', 'wss://nos.lol']
 
-  let runListSubId = $state<string | null>(null)
-  let runDetailSubId = $state<string | null>(null)
   let liveDurationSeconds = $state<number | null>(null)
-  let subListenerCleanup: (() => void) | null = null
 
   const selectedWorker = $derived(getSelectedWorker(rerunDraft, discoveredWorkers))
   const compatibleMints = $derived.by(() => getCompatibleMints(selectedWorker, walletMints))
@@ -251,44 +254,6 @@
     }
   }
 
-  async function refreshRuns(nextRepo: RepoContextNormalized | null = repo, background = false) {
-    if (!bridge || !nextRepo) {
-      console.log('[pipelines] refreshRuns skipped: bridge=', !!bridge, 'nextRepo=', !!nextRepo)
-      return
-    }
-    console.log('[pipelines] refreshRuns: repo=', nextRepo.repoName, 'naddr=', nextRepo.repoNaddr?.slice(0, 30), 'relays=', nextRepo.repoRelays)
-
-    const seq = ++loadSeq
-    if (!background) {
-      loading = true
-      error = null
-    }
-
-    try {
-      const nextRuns = await refreshRunsController(bridge, nextRepo)
-      if (seq !== loadSeq) return
-      workflowRuns = nextRuns
-      const nextSelection = reconcileSelectedRunState({
-        workflowRuns: nextRuns,
-        selectedRunId,
-        selectedRunDetail,
-      })
-      selectedRunId = nextSelection.selectedRunId
-      selectedRunDetail = nextSelection.selectedRunDetail
-      if (background) {
-      }
-    } catch (err) {
-      if (seq !== loadSeq) return
-      if (!background) {
-        error = friendlyErrorMessage(err instanceof Error ? err.message : String(err))
-      } else {
-        console.warn('[pipelines] background refreshRuns failed', err)
-      }
-    } finally {
-      if (seq === loadSeq && !background) loading = false
-    }
-  }
-
   async function refreshSelectedRun(background = false) {
     if (!bridge || !repo || !selectedRunId) return
 
@@ -346,6 +311,31 @@
       repoMetadataError = friendlyErrorMessage(err instanceof Error ? err.message : String(err))
     } finally {
       repoMetadataLoading = false
+    }
+  }
+
+  async function openRunById(runId: string) {
+    if (!bridge || !repo || !runId) return
+    const seq = ++detailSeq
+    applyDetailSessionState({
+      selectedRunId: runId,
+      selectedRunDetail: null,
+      detailError: null,
+      detailLoading: true,
+    })
+
+    try {
+      const detail = await loadRunDetailController(bridge, repo, runId)
+      if (seq !== detailSeq) return
+      applyDetailSessionState(createOpenedDetailSessionState(detail))
+    } catch (err) {
+      if (seq !== detailSeq) return
+      applyDetailSessionState(
+        createDetailSessionErrorState(
+          runId,
+          friendlyErrorMessage(err instanceof Error ? err.message : String(err)),
+        ),
+      )
     }
   }
 
@@ -413,9 +403,67 @@
     applySubmissionReset()
   }
 
-  function resetFilters() {
-    statusFilter = 'all'
-    searchTerm = ''
+  const RUN_HASH_PREFIX = '#run-'
+
+  function readRunIdFromUrl(): string | null {
+    try {
+      const parentHash = window.parent?.location?.hash
+      if (parentHash?.startsWith(RUN_HASH_PREFIX)) {
+        return parentHash.slice(RUN_HASH_PREFIX.length) || null
+      }
+    } catch {
+      // cross-origin read blocked — fall through to iframe hash
+    }
+    if (window.location.hash.startsWith(RUN_HASH_PREFIX)) {
+      return window.location.hash.slice(RUN_HASH_PREFIX.length) || null
+    }
+    return null
+  }
+
+  function writeRunIdToUrl(id: string | null) {
+    const parentTarget = id ? RUN_HASH_PREFIX + id : '#'
+    try {
+      if (window.parent && window.parent !== window) {
+        // Cross-origin hash-only navigation via string assignment to
+        // `location` is permitted by the HTML spec (same-document nav).
+        // Reading `location.hash` cross-origin is NOT permitted, so we
+        // can't use the property setter — hence this form.
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        ;(window.parent as any).location = parentTarget
+      }
+    } catch {
+      // cross-origin write blocked — rely on iframe hash below
+    }
+    try {
+      const baseUrl = window.location.pathname + window.location.search
+      history.replaceState(null, '', id ? `${baseUrl}${RUN_HASH_PREFIX}${id}` : baseUrl)
+    } catch {
+      // ignore
+    }
+  }
+
+  function triggerLabel(event: string | undefined): string {
+    switch (event) {
+      case 'push':
+        return 'Triggered by push'
+      case 'pull_request':
+        return 'Triggered via pull request'
+      case 'schedule':
+        return 'Triggered by schedule'
+      case 'manual':
+      case undefined:
+        return 'Triggered manually'
+      default:
+        return `Triggered via ${event}`
+    }
+  }
+
+  function profileNameFor(pubkey: string): string {
+    void profileTick // re-run when new events (incl. profiles) arrive
+    if (!pubkey) return ''
+    const event = eventStore.getReplaceable(0, pubkey)
+    if (!event) return ''
+    return getProfileContent(event)?.display_name || getProfileContent(event)?.name || ''
   }
 
   function addRerunSecret() {
@@ -570,7 +618,6 @@
       })
 
       applySubmissionReset()
-      workflowRuns = nextState.workflowRuns
       applyDetailSessionState(nextState.detailSessionState)
 
       await showToast(`${submissionMode === 'new' ? 'Run' : 'Rerun'} submitted: ${nextState.runId.slice(0, 8)}`, 'success')
@@ -590,18 +637,123 @@
     return response.text()
   }
 
-  const filteredRuns = $derived.by(() =>
-    workflowRuns.filter(run => {
-      if (searchTerm) {
-        const query = searchTerm.toLowerCase()
-        const fields = [run.name, run.branch, run.commitMessage, run.commit, run.actor, run.workflowPath || '']
-        if (!fields.some(field => field.toLowerCase().includes(query))) return false
-      }
+  function distinct(values: Array<string | undefined>): string[] {
+    const seen = new Set<string>()
+    for (const v of values) if (v) seen.add(v)
+    return [...seen].sort()
+  }
 
-      if (statusFilter !== 'all' && run.status !== statusFilter) return false
-      return true
-    }),
+  function workflowBasename(path: string): string {
+    return path.split('/').pop() || path
+  }
+
+  const workflowOptions = $derived(
+    distinct(workflowRuns.map(r => r.workflowPath)).map(v => ({
+      value: v,
+      label: workflowBasename(v),
+    })),
   )
+  const triggerOptions = $derived(
+    distinct(workflowRuns.map(r => r.event)).map(v => ({value: v, label: v})),
+  )
+  const branchOptions = $derived.by(() => {
+    const branches = distinct(workflowRuns.map(r => r.branch))
+    const sorted = branches.sort((a, b) => {
+      if (a === defaultBranch) return -1
+      if (b === defaultBranch) return 1
+      return a.localeCompare(b)
+    })
+    return sorted.map(v => ({
+      value: v,
+      label: v === defaultBranch ? `${v} (default)` : v,
+    }))
+  })
+  const actorOptions = $derived.by(() => {
+    void profileTick
+    const pubkeys = distinct(workflowRuns.map(r => r.actor))
+    return pubkeys
+      .map(pk => ({value: pk, label: profileNameFor(pk) || `${pk.slice(0, 8)}…`}))
+      .sort((a, b) => a.label.localeCompare(b.label))
+  })
+  const statusOptions: Array<{value: string; label: string}> = [
+    {value: 'success', label: 'Success'},
+    {value: 'failure', label: 'Failure'},
+    {value: 'running', label: 'Running'},
+    {value: 'in_progress', label: 'In progress'},
+    {value: 'queued', label: 'Queued'},
+    {value: 'pending', label: 'Pending'},
+    {value: 'cancelled', label: 'Cancelled'},
+    {value: 'skipped', label: 'Skipped'},
+  ]
+
+  const filteredRuns = $derived.by(() => {
+    void profileTick
+    const now = Date.now()
+    const query = searchTerm.trim().toLowerCase()
+
+    return workflowRuns
+      .filter(run => {
+        if (
+          !showStalePending &&
+          run.status === 'pending' &&
+          now - run.createdAt > STALE_PENDING_MS
+        )
+          return false
+
+        if (workflowFilter.size > 0 && !workflowFilter.has(run.workflowPath || '')) return false
+        if (triggerFilter.size > 0 && !triggerFilter.has(run.event || '')) return false
+        if (statusFilter.size > 0 && !statusFilter.has(run.status)) return false
+        if (branchFilter.size > 0 && !branchFilter.has(run.branch)) return false
+        if (actorFilter.size > 0 && !actorFilter.has(run.actor)) return false
+
+        if (query) {
+          const haystack = [
+            run.name,
+            run.branch,
+            run.commitMessage,
+            run.commit,
+            run.actor,
+            run.workflowPath || '',
+            profileNameFor(run.actor),
+          ]
+            .filter(Boolean)
+            .join(' ')
+            .toLowerCase()
+          if (!haystack.includes(query)) return false
+        }
+
+        return true
+      })
+      .sort((a, b) => b.createdAt - a.createdAt)
+  })
+
+  $effect(() => {
+    const sub = eventStore.insert$.subscribe(event => {
+      if (event.kind === 0) profileTick = (profileTick + 1) % Number.MAX_SAFE_INTEGER
+    })
+    return () => sub.unsubscribe()
+  })
+
+  // Sync selected run <-> URL hash so refresh + share preserves state.
+  $effect(() => {
+    const initial = readRunIdFromUrl()
+    if (initial && !selectedRunId && bridge && repo) {
+      void openRunById(initial)
+    }
+    const onHashChange = () => {
+      const next = readRunIdFromUrl()
+      if (next === selectedRunId) return
+      if (next) void openRunById(next)
+      else if (selectedRunId) closeRun()
+    }
+    window.addEventListener('hashchange', onHashChange)
+    return () => window.removeEventListener('hashchange', onHashChange)
+  })
+
+  $effect(() => {
+    if (readRunIdFromUrl() === selectedRunId) return
+    writeRunIdToUrl(selectedRunId)
+  })
 
   $effect(() => {
     if (!bridge) return
@@ -619,100 +771,31 @@
     void refreshRepoMetadata()
   })
 
-  // Initial load + persistent subscription for run events
+  // Runs list comes from a module-scoped BehaviorSubject keyed by repoAddress.
+  // On HMR the subject persists, so remounted subscribers get the current list
+  // immediately instead of starting empty.
   $effect(() => {
-    if (!bridge || !repo) return
+    if (!repo?.repoAddress) return
 
-    const currentBridge = bridge
-    const currentRepo = repo
-
-    // One-time initial load from relays
-    void refreshRuns(currentRepo)
-
-    // Open a persistent subscription — events are merged directly into state
-    let subId: string | null = null
-    const relays = [...new Set([...currentRepo.repoRelays, ...FALLBACK_RELAYS])]
-
-    if (currentRepo.repoAddress) {
-      void subscribe(currentBridge, relays, {
-        kinds: [5401, 5100, 5402, 5101, 30100],
-        '#a': [currentRepo.repoAddress],
-        since: Math.floor(Date.now() / 1000) - 60,
-      }, (event) => {
-        // Merge the incoming event directly into the run list
-        workflowRuns = mergeEventIntoRuns(workflowRuns, event, currentRepo.repoAddress)
-
-        // Also update the selected detail if it matches
-        const detail = selectedRunDetail
-        if (detail) {
-          const updated = mergeEventIntoDetail(detail, event)
-          if (updated !== detail) {
-            selectedRunDetail = updated
-          }
-        }
-      }).then(id => {
-        subId = id
-        if (id) {
-          runListSubId = id
-        }
-      })
-    }
-
-    return () => {
-      if (subId) {
-        runListSubId = null
-        void unsubscribe(currentBridge, subId)
-      }
-    }
-  })
-
-  // Subscribe to detail-level events for the selected active run
-  // Events are merged directly into selectedRunDetail by the run list subscription above.
-  // This subscription adds a narrower #e filter to catch events that reference the run/job
-  // by id but don't carry the repo #a tag.
-  $effect(() => {
-    if (!selectedRunId || !bridge || !repo) return
-
-    const detail = untrack(() => selectedRunDetail)
-    if (!detail || !isActiveRunStatus(detail.run.status)) return
-
-    const currentBridge = bridge
-    const currentRunId = selectedRunId
-    const loomJobId = detail.run.loomJobEvent?.id
-
-    const eTags = [currentRunId]
-    if (loomJobId) eTags.push(loomJobId)
-
+    const repoAddress = repo.repoAddress
     const relays = [...new Set([...repo.repoRelays, ...FALLBACK_RELAYS])]
+    const trustedAuthors = [...new Set([repo.repoPubkey, ...(repo.maintainers ?? [])])]
 
-    let subId: string | null = null
-    void subscribe(currentBridge, relays, {
-      kinds: [5402, 5101, 30100],
-      '#e': eTags,
-      since: Math.floor(Date.now() / 1000) - 60,
-    }, (event) => {
-      // Merge into the detail
-      const currentDetail = selectedRunDetail
-      if (currentDetail) {
-        const updated = mergeEventIntoDetail(currentDetail, event)
-        if (updated !== currentDetail) {
-          selectedRunDetail = updated
-        }
-      }
-      // Also update the run in the list
-      workflowRuns = mergeEventIntoRuns(workflowRuns, event)
-    }).then(id => {
-      subId = id
-      if (id) {
-        runDetailSubId = id
-      }
+    const runsSub = repoRuns$(repoAddress, relays, trustedAuthors).subscribe(runs => {
+      workflowRuns = runs
+    })
+
+    // Detail merging still needs the raw event stream.
+    const detailSub = repoEvents$(repoAddress, relays, trustedAuthors).subscribe(event => {
+      const detail = selectedRunDetail
+      if (!detail) return
+      const updated = mergeEventIntoDetail(detail, event)
+      if (updated !== detail) selectedRunDetail = updated
     })
 
     return () => {
-      if (subId) {
-        runDetailSubId = null
-        void unsubscribe(currentBridge, subId)
-      }
+      runsSub.unsubscribe()
+      detailSub.unsubscribe()
     }
   })
 
@@ -747,7 +830,7 @@
       rerunDraft = {...rerunDraft, workflowPath: repoWorkflows[0].path}
     }
 
-    if ((!rerunDraft.branch || rerunDraft.branch === 'main') && defaultBranch) {
+    if (!rerunDraft.branch && defaultBranch) {
       rerunDraft = {...rerunDraft, branch: defaultBranch}
     }
   })
@@ -873,9 +956,15 @@
           workflowJobsLoading = false
         }
       } else {
-        workflowJobsError = repoMetadataLoading
-          ? 'Waiting for workflow definitions from the host…'
-          : `Workflow definition not available for ${run.workflowPath}`
+        if (repoMetadataLoading) {
+          workflowJobsError = 'Waiting for workflow definitions from the host…'
+        } else if (repoMetadataError) {
+          workflowJobsError = `Can't load workflow ${run.workflowPath}: ${repoMetadataError}`
+        } else {
+          workflowJobsError =
+            `Workflow ${run.workflowPath} is not in the current branch. ` +
+            `The commit may have been force-pushed, the file removed, or the run was on a branch that no longer exists.`
+        }
         workflowJobsLoading = false
       }
     }
@@ -884,41 +973,21 @@
   $effect(() => {
     return setupWidgetLifecycle({
       onBridgeChange: nextBridge => {
-        // Clean up old subscriptions
-        // IMPORTANT: use untrack() to avoid reading 'bridge' as a tracked dependency
-        // — setupWidgetLifecycle calls this callback synchronously, which would make
-        // this effect depend on 'bridge', creating an infinite read→write→re-trigger cycle
-        const oldBridge = untrack(() => bridge)
-        if (oldBridge) {
-          unsubscribeAll(oldBridge)
-          subListenerCleanup = null
-        }
         bridge = nextBridge
-        // Attach subscription listener for the new bridge
-        if (nextBridge) {
-          subListenerCleanup = attachSubscriptionListener(nextBridge)
-        }
       },
       onRepoContextChange: nextRepoCtx => {
         repoCtx = nextRepoCtx
       },
-      onRefreshRuns: nextRepo => refreshRuns(nextRepo ?? repo),
       onRepoChange: () => {
         closeRun()
         repoWorkflows = []
         repoBranches = []
       },
       onUnmount: () => {
-        loadSeq += 1
         detailSeq += 1
         workflowRuns = []
         repoWorkflows = []
         repoBranches = []
-        const currentBridge = untrack(() => bridge)
-        if (currentBridge) {
-          unsubscribeAll(currentBridge)
-          subListenerCleanup = null
-        }
         closeRun()
       },
     })
@@ -953,149 +1022,170 @@
         </div>
       {/if}
     {:else}
-    {#if !selectedRunId}
-    <div class="flex flex-col gap-3 sm:flex-row sm:items-center">
-      <div class="relative flex-1">
-        <input
-          class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground"
-          bind:value={searchTerm}
-          type="text"
-          placeholder="Search runs, commits, branches, or actors…" />
+    {#if !selectedRunId && repoMetadataError}
+      <div class="rounded-lg border border-yellow-500/30 bg-yellow-500/10 px-3 py-2 text-xs text-yellow-300">
+        Repo metadata: {repoMetadataError}
       </div>
-      <div class="flex items-center gap-2">
-        <button class="rounded-md border border-input bg-background px-3 py-2 text-sm hover:bg-accent" onclick={() => (showFilters = !showFilters)}>
-          <Filter class="h-4 w-4" />
-        </button>
-        <button class="inline-flex items-center gap-2 rounded-md border border-input bg-background px-3 py-2 text-sm hover:bg-accent" onclick={openNewRunForm}>
-          <Play class="h-4 w-4" />
-          New run
-        </button>
-      </div>
-    </div>
-    {#if repoMetadataError}
-      <p class="text-xs text-yellow-400">Repo metadata: {repoMetadataError}</p>
-    {/if}
     {/if}
 
     <div class="space-y-4">
-      {#if !selectedRunId}
+      {#if !selectedRunId && rerunDraft}
+      <aside class="space-y-4 rounded-lg border border-border bg-card p-4">
+        <div class="flex items-start justify-between gap-3">
+          <div>
+            <h3 class="text-lg font-semibold">New workflow run</h3>
+            <p class="mt-1 text-sm text-muted-foreground">Create a new Hive CI run using live workflow and branch data from this repo.</p>
+          </div>
+          <button class="rounded-md border border-input px-3 py-1.5 text-sm hover:bg-accent" onclick={applySubmissionReset}>
+            Cancel
+          </button>
+        </div>
+
+        <RunSubmissionForm
+          title="New workflow run"
+          description="Recreated from the original PR flow: workflow selection, worker pricing, wallet-aware mint selection, and generated runner script."
+          {submissionMode}
+          bind:rerunDraft
+          bind:rerunCommandMode
+          bind:rerunArgsText
+          bind:rerunPaymentToken
+          bind:rerunSecrets
+          bind:selectedMint
+          bind:paymentAmount
+          bind:maxDuration
+          bind:runnerScriptTemplate
+          bind:runnerScriptAutoManaged
+          {rerunSubmitting}
+          {discoveredWorkers}
+          {loadingWorkers}
+          {walletAvailable}
+          {walletLoading}
+          {walletError}
+          {walletTotalBalance}
+          {walletBalancesByMint}
+          {visibleMintOptions}
+          {generatingPaymentToken}
+          {autoTokenPromptOpen}
+          {selectedWorker}
+          {compatibleMints}
+          {signerError}
+          {canGenerateSuggestedToken}
+          {availableBranches}
+          {defaultBranch}
+          availableWorkflows={repoWorkflows}
+          suggestedPaymentAmount={suggestedPaymentAmount}
+          onRefreshWorkers={() => void refreshWorkers()}
+          onRefreshWallet={() => void refreshWallet()}
+          onGeneratePaymentToken={() => void generatePaymentToken()}
+          onConfirmAutoTokenGeneration={() => void confirmAutoTokenGeneration()}
+          onDismissAutoTokenGeneration={dismissAutoTokenGeneration}
+          onAddRerunSecret={addRerunSecret}
+          onRemoveRerunSecret={removeRerunSecret}
+          onSetRerunCommandMode={mode => {
+            rerunCommandMode = mode
+            if (mode === 'reuse') {
+              runnerScriptAutoManaged = false
+            } else if (rerunDraft) {
+              runnerScriptAutoManaged = true
+              runnerScriptTemplate = buildRunnerScriptTemplate(rerunDraft.workflowPath, selectedWorker, rerunDraft.branch)
+            }
+          }}
+          onRegenerateTemplate={() => {
+            if (!rerunDraft) return
+            runnerScriptAutoManaged = true
+            runnerScriptTemplate = buildRunnerScriptTemplate(rerunDraft.workflowPath, selectedWorker, rerunDraft.branch)
+          }}
+          onSubmit={() => void submitRerunRequest()}
+        />
+      </aside>
+      {:else if !selectedRunId}
       <section class="space-y-4">
 
-        {#if showFilters}
-          <div class="rounded-lg border border-border bg-card p-4">
-            <div class="grid gap-4 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-end">
-              <div class="space-y-2">
-                <label for="status-filter" class="text-sm font-medium">Status</label>
-                <select id="status-filter" bind:value={statusFilter} class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm text-foreground">
-                  <option value="all">All statuses</option>
-                  <option value="success">Success</option>
-                  <option value="failure">Failure</option>
-                  <option value="running">Running</option>
-                  <option value="queued">Queued</option>
-                  <option value="pending">Pending</option>
-                </select>
-              </div>
-              <button class="rounded-md border border-input px-3 py-2 text-sm hover:bg-accent" onclick={resetFilters}>
-                Reset filters
-              </button>
+        <div class="overflow-hidden rounded-lg border border-border bg-card">
+          <div class="flex flex-wrap items-center gap-3 border-b border-border bg-card/60 px-3 py-2">
+            <button class="inline-flex items-center gap-2 rounded-md border border-green-700 bg-green-600 px-3 py-1.5 text-sm font-medium text-white shadow-sm hover:bg-green-500" onclick={openNewRunForm}>
+              <Play class="h-4 w-4" />
+              New run
+            </button>
+            <input
+              class="min-w-0 flex-1 rounded-md border border-input bg-background px-3 py-1.5 text-sm text-foreground placeholder:text-muted-foreground"
+              bind:value={searchTerm}
+              type="text"
+              placeholder="Search runs, commits, branches, actors…" />
+            <div class="flex items-center gap-1">
+              <FilterDropdown
+                label="Workflow"
+                options={workflowOptions}
+                selected={workflowFilter}
+                onChange={next => (workflowFilter = next)} />
+              <FilterDropdown
+                label="Event"
+                options={triggerOptions}
+                selected={triggerFilter}
+                onChange={next => (triggerFilter = next)} />
+              <FilterDropdown
+                label="Status"
+                options={statusOptions}
+                selected={statusFilter}
+                onChange={next => (statusFilter = next)}>
+                {#snippet extraBottom()}
+                  <label class="flex cursor-pointer items-center gap-2 text-xs text-muted-foreground">
+                    <input type="checkbox" bind:checked={showStalePending} class="filter-check" />
+                    Show stale pending (&gt; 72h)
+                  </label>
+                {/snippet}
+              </FilterDropdown>
+              <FilterDropdown
+                label="Branch"
+                options={branchOptions}
+                selected={branchFilter}
+                onChange={next => (branchFilter = next)} />
+              <FilterDropdown
+                label="Triggered by"
+                options={actorOptions}
+                selected={actorFilter}
+                onChange={next => (actorFilter = next)}>
+                {#snippet row(option)}
+                  <UserDisplay pubkey={option.value} link={false} />
+                {/snippet}
+              </FilterDropdown>
             </div>
           </div>
-        {/if}
 
-        {#if loading}
-          <div class="flex items-center justify-center rounded-lg border border-border bg-card py-16">
-            <RotateCw class="h-8 w-8 animate-spin text-muted-foreground" />
-          </div>
-        {:else if error}
-          <div class="flex flex-col items-center justify-center rounded-lg border border-border bg-card py-16 text-center text-muted-foreground">
-            <AlertCircle class="mb-3 h-8 w-8" />
-            <p class="max-w-xl text-sm">{error}</p>
-          </div>
-        {:else if filteredRuns.length === 0}
-          <div class="flex flex-col items-center justify-center rounded-lg border border-border bg-card py-16 text-muted-foreground">
-            <SearchX class="mb-3 h-8 w-8" />
-            <p class="text-sm">No pipeline runs found.</p>
-            {#if repo}
-              <p class="mt-2 max-w-md text-xs">
-                Queried relays: {repo.repoRelays.join(', ') || 'none'}<br/>
-                Repo naddr: {repo.repoNaddr ? repo.repoNaddr.slice(0, 40) + '…' : 'not set'}<br/>
-                Workflows: {repoWorkflows.length} found
-              </p>
-            {:else}
-              <p class="mt-2 text-xs text-yellow-400">Repository context not received from host.</p>
-            {/if}
-          </div>
-        {:else}
-          <div class="overflow-hidden rounded-lg border border-border bg-card">
+          {#if loading}
+            <div class="flex items-center justify-center py-16">
+              <RotateCw class="h-8 w-8 animate-spin text-muted-foreground" />
+            </div>
+          {:else if error}
+            <div class="flex flex-col items-center justify-center py-16 text-center text-muted-foreground">
+              <AlertCircle class="mb-3 h-8 w-8" />
+              <p class="max-w-xl text-sm">{error}</p>
+            </div>
+          {:else if filteredRuns.length === 0}
+            <div class="flex flex-col items-center justify-center py-16 text-muted-foreground">
+              <SearchX class="mb-3 h-8 w-8" />
+              <p class="text-sm">No pipeline runs found.</p>
+              {#if repo}
+                <p class="mt-2 max-w-md text-xs">
+                  Queried relays: {repo.repoRelays.join(', ') || 'none'}<br/>
+                  Repo naddr: {repo.repoNaddr ? repo.repoNaddr.slice(0, 40) + '…' : 'not set'}<br/>
+                  Workflows: {repoWorkflows.length} found
+                </p>
+              {:else}
+                <p class="mt-2 text-xs text-yellow-400">Repository context not received from host.</p>
+              {/if}
+            </div>
+          {:else}
             {#each filteredRuns as run, i (run.id)}
-              {@const StatusIcon = getStatusIcon(run.status)}
-              <button
-                class={`group flex w-full items-center gap-4 px-4 py-3 text-left transition-colors hover:bg-accent/40 ${i > 0 ? 'border-t border-border' : ''} ${selectedRunId === run.id ? 'bg-accent/30' : ''}`}
-                onclick={() => void openRun(run)}
-              >
-                <div class={`shrink-0 ${getStatusColor(run.status)}`}>
-                  {#if run.status === 'running' || run.status === 'in_progress'}
-                    <RotateCw class="h-5 w-5 animate-spin" />
-                  {:else}
-                    <StatusIcon class="h-5 w-5" />
-                  {/if}
-                </div>
-
-                <div class="min-w-0 flex-1">
-                  <div class="truncate text-base font-semibold text-foreground">
-                    {run.commitMessage || run.name}
-                  </div>
-                  <div class="mt-1 flex min-w-0 items-center gap-2 truncate text-xs text-muted-foreground">
-                    <span class="font-medium text-foreground/80">{run.name}</span>
-                    {#if run.commit}
-                      <span>·</span>
-                      <span class="inline-flex items-center gap-1">
-                        <GitCommit class="h-3 w-3" />
-                        <span class="font-mono">{shortId(run.commit, 7)}</span>
-                      </span>
-                    {/if}
-                    {#if run.actor}
-                      <span>·</span>
-                      <span class="inline-flex min-w-0 items-center gap-1">
-                        <span class="shrink-0">triggered by</span>
-                        <UserDisplay pubkey={run.actor} />
-                      </span>
-                    {/if}
-                    {#if selectedRunId === run.id && detailRefreshing && isActiveRunStatus(run.status)}
-                      <span>·</span>
-                      <span class="text-sky-300">refreshing…</span>
-                    {/if}
-                  </div>
-                </div>
-
-                <div class="hidden shrink-0 sm:block">
-                  <span class="inline-flex items-center gap-1 rounded-md border border-border bg-background/60 px-2 py-1 text-xs font-medium text-sky-300">
-                    <GitBranch class="h-3 w-3" />
-                    {run.branch}
-                  </span>
-                </div>
-
-                <div class="hidden shrink-0 flex-col items-end text-xs text-muted-foreground sm:flex">
-                  <div class="flex items-center gap-1">
-                    <Clock class="h-3 w-3" />
-                    <span>{formatTimeAgo(run.createdAt)}</span>
-                  </div>
-                  {#if run.duration}
-                    <div class="mt-0.5">{formatDuration(run.duration)}</div>
-                  {/if}
-                </div>
-
-                <span class={`hidden shrink-0 items-center rounded-full border px-2 py-0.5 text-xs font-medium md:inline-flex ${getStatusBadge(run.status)}`}>
-                  {statusLabel(run.status)}
-                </span>
-
-                <div class="shrink-0 text-muted-foreground transition-colors group-hover:text-foreground">
-                  <ChevronRight class="h-5 w-5" />
-                </div>
-              </button>
+              <RunListItem
+                {run}
+                selected={selectedRunId === run.id}
+                divider={i > 0}
+                refreshing={detailRefreshing}
+                onSelect={() => void openRun(run)} />
             {/each}
-          </div>
-        {/if}
+          {/if}
+        </div>
 
         <div class="rounded-lg border border-border bg-card p-4">
           <div class="grid grid-cols-2 gap-4 sm:grid-cols-4">
@@ -1132,275 +1222,234 @@
         {:else if selectedRunDetail}
           {@const run = selectedRunDetail.run}
           {@const StatusIcon = getStatusIcon(run.status)}
+          {@const hiveciEvents = [
+            {label: 'Workflow run (5401)', event: run.runEvent},
+            {label: 'Workflow result (5402)', event: run.workflowLogEvent},
+          ]}
+          {@const loomEvents = [
+            {label: 'Loom job (5100)', event: run.loomJobEvent},
+            {label: 'Loom status (30100)', event: run.loomStatusEvent},
+            {label: 'Loom result (5101)', event: run.loomResultEvent},
+          ]}
           <div class="space-y-4">
-            <div class="flex items-start justify-between gap-3">
-              <div>
-                <div class="flex items-center gap-2">
-                  <button class="inline-flex items-center gap-1 rounded-md border border-input bg-background px-2 py-1 text-sm hover:bg-accent" onclick={closeRun}>
-                    <ArrowLeft class="h-4 w-4" />
-                    Back
-                  </button>
-                  <h3 class="text-lg font-semibold">{run.name}</h3>
+            <!-- Top bar -->
+            <div class="flex items-start gap-3">
+              <button class="rounded-md p-1.5 text-muted-foreground hover:bg-accent hover:text-foreground" onclick={closeRun} title="Back to runs">
+                <ArrowLeft class="h-5 w-5" />
+              </button>
+              <div class="min-w-0 flex-1">
+                <div class="flex min-w-0 flex-wrap items-center gap-2">
+                  <div class={`shrink-0 ${getStatusColor(run.status)}`}>
+                    {#if run.status === 'running' || run.status === 'in_progress'}
+                      <RotateCw class="h-5 w-5 animate-spin" />
+                    {:else}
+                      <StatusIcon class="h-5 w-5" />
+                    {/if}
+                  </div>
+                  <h1 class="min-w-0 truncate text-2xl font-semibold">
+                    {run.commitMessage || run.name}
+                  </h1>
+                  <span class="shrink-0 font-mono text-lg text-muted-foreground">
+                    #{shortId(run.id, 7)}
+                  </span>
                 </div>
-                <p class="mt-1 text-sm text-muted-foreground">{run.workflowPath || 'Workflow run'}</p>
                 {#if detailRefreshing && isActiveRunStatus(run.status)}
                   <p class="mt-1 text-xs text-sky-300">Refreshing active run…</p>
                 {/if}
               </div>
-              <span class={`inline-flex items-center gap-1 rounded-full border px-2 py-1 text-xs font-medium ${getStatusBadge(run.status)}`}>
-                {#if run.status === 'running' || run.status === 'in_progress'}
-                  <RotateCw class="h-3.5 w-3.5 animate-spin" />
-                {:else}
-                  <StatusIcon class="h-3.5 w-3.5" />
-                {/if}
-                {statusLabel(run.status)}
-              </span>
+              <div class="flex shrink-0 items-center gap-2">
+                <button class="inline-flex items-center gap-2 rounded-md border border-green-700 bg-green-600 px-3 py-1.5 text-sm font-medium text-white shadow-sm hover:bg-green-500 disabled:opacity-60" onclick={openRerunForm} disabled={!!rerunDraft}>
+                  <Play class="h-4 w-4" />
+                  Re-run all jobs
+                </button>
+                <RunActionsMenu
+                  {run}
+                  worker={selectedRunDetail.worker}
+                  currentView={currentDetailView}
+                  onViewChange={next => (currentDetailView = next)}
+                  onCopyRunId={() => void copyText(run.id, 'Run ID')}
+                  onCopyCommit={() => void copyText(run.commit, 'Commit')} />
+              </div>
+            </div>
+
+            <!-- Metadata strip -->
+            <div class="grid gap-4 rounded-lg border border-border bg-card p-4 sm:grid-cols-3">
+              <div class="space-y-1">
+                <div class="text-xs text-muted-foreground">{triggerLabel(run.event)}</div>
+                <div class="flex items-center gap-2 text-sm">
+                  {#if run.actor}
+                    <UserDisplay pubkey={run.actor} />
+                  {/if}
+                  <span class="text-muted-foreground">·</span>
+                  <span>{formatTimeAgo(run.createdAt)}</span>
+                </div>
+              </div>
+              <div class="space-y-1">
+                <div class="text-xs text-muted-foreground">Status</div>
+                <span class={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-xs font-medium ${getStatusBadge(run.status)}`}>
+                  {#if run.status === 'running' || run.status === 'in_progress'}
+                    <RotateCw class="h-3.5 w-3.5 animate-spin" />
+                  {:else}
+                    <StatusIcon class="h-3.5 w-3.5" />
+                  {/if}
+                  {statusLabel(run.status)}
+                </span>
+              </div>
+              <div class="space-y-1">
+                <div class="text-xs text-muted-foreground">Total duration</div>
+                <div class="text-sm font-medium">
+                  {isActiveRunStatus(run.status) && liveDurationSeconds !== null
+                    ? formatDuration(liveDurationSeconds)
+                    : formatDuration(run.duration)}
+                </div>
+              </div>
             </div>
 
             {#if run.status === 'failure' && !run.workflowLogEvent && run.loomResultEvent}
               <p class="text-xs text-yellow-400">Error (workflow result event missing — status inferred from loom result)</p>
             {/if}
 
-            {#if isActiveRunStatus(run.status) && liveDurationSeconds !== null}
-              <div class="flex items-center gap-2 text-sm text-muted-foreground">
-                <Clock class="h-3.5 w-3.5" />
-                <span>Running for {formatDuration(liveDurationSeconds)}</span>
-              </div>
-            {/if}
-
-            <div class="flex flex-wrap items-center gap-2">
-              <button class="inline-flex items-center gap-2 rounded-md border border-input px-3 py-2 text-sm hover:bg-accent" onclick={() => void refreshSelectedRun(detailLoading || detailRefreshing)}>
-                <RefreshCw class={`h-4 w-4 ${detailLoading || detailRefreshing ? 'animate-spin' : ''}`} />
-                Refresh run
-              </button>
-              <button class="inline-flex items-center gap-2 rounded-md border border-input px-3 py-2 text-sm hover:bg-accent" onclick={openRerunForm}>
-                <Play class="h-4 w-4" />
-                Prepare rerun
-              </button>
-              <a class="inline-flex items-center gap-2 rounded-md border border-input px-3 py-2 text-sm hover:bg-accent" href={publicLinkForRun(run.id)} target="_blank" rel="noreferrer">
-                <ExternalLink class="h-4 w-4" />
-                Open event
-              </a>
-              {#if rerunDraft}
-                <button class="rounded-md border border-input px-3 py-2 text-sm hover:bg-accent" onclick={applySubmissionReset}>
-                  Cancel
-                </button>
-              {/if}
-            </div>
-
             {#if rerunDraft}
-              <RunSubmissionForm
-                title="Manual rerun"
-                description="This reuses the prior workflow metadata and loom command, but needs a fresh payment token and any secrets that were previously encrypted."
-                {submissionMode}
-                bind:rerunDraft
-                bind:rerunCommandMode
-                bind:rerunArgsText
-                bind:rerunPaymentToken
-                bind:rerunSecrets
-                bind:selectedMint
-                bind:paymentAmount
-                bind:maxDuration
-                bind:runnerScriptTemplate
-                bind:runnerScriptAutoManaged
-                {rerunSubmitting}
-                {discoveredWorkers}
-                {loadingWorkers}
-                {walletAvailable}
-                {walletLoading}
-                {walletError}
-                {walletTotalBalance}
-                {walletBalancesByMint}
-                {visibleMintOptions}
-                {generatingPaymentToken}
-                {autoTokenPromptOpen}
-                {selectedWorker}
-                {compatibleMints}
-                {signerError}
-                {canGenerateSuggestedToken}
-                {availableBranches}
-                {defaultBranch}
-                availableWorkflows={repoWorkflows}
-                suggestedPaymentAmount={suggestedPaymentAmount}
-                onRefreshWorkers={() => void refreshWorkers()}
-                onRefreshWallet={() => void refreshWallet()}
-                onGeneratePaymentToken={() => void generatePaymentToken()}
-                onConfirmAutoTokenGeneration={() => void confirmAutoTokenGeneration()}
-                onDismissAutoTokenGeneration={dismissAutoTokenGeneration}
-                onAddRerunSecret={addRerunSecret}
-                onRemoveRerunSecret={removeRerunSecret}
-                onSetRerunCommandMode={mode => {
-                  rerunCommandMode = mode
-                  if (mode === 'reuse') {
-                    runnerScriptAutoManaged = false
-                  } else if (rerunDraft) {
+              <div class="rounded-lg border border-border bg-card p-4">
+                <div class="mb-3 flex items-center justify-between">
+                  <h3 class="text-sm font-semibold">Manual rerun</h3>
+                  <button class="rounded-md border border-input px-3 py-1 text-xs hover:bg-accent" onclick={applySubmissionReset}>
+                    Cancel
+                  </button>
+                </div>
+                <RunSubmissionForm
+                  title="Manual rerun"
+                  description="This reuses the prior workflow metadata and loom command, but needs a fresh payment token and any secrets that were previously encrypted."
+                  {submissionMode}
+                  bind:rerunDraft
+                  bind:rerunCommandMode
+                  bind:rerunArgsText
+                  bind:rerunPaymentToken
+                  bind:rerunSecrets
+                  bind:selectedMint
+                  bind:paymentAmount
+                  bind:maxDuration
+                  bind:runnerScriptTemplate
+                  bind:runnerScriptAutoManaged
+                  {rerunSubmitting}
+                  {discoveredWorkers}
+                  {loadingWorkers}
+                  {walletAvailable}
+                  {walletLoading}
+                  {walletError}
+                  {walletTotalBalance}
+                  {walletBalancesByMint}
+                  {visibleMintOptions}
+                  {generatingPaymentToken}
+                  {autoTokenPromptOpen}
+                  {selectedWorker}
+                  {compatibleMints}
+                  {signerError}
+                  {canGenerateSuggestedToken}
+                  {availableBranches}
+                  {defaultBranch}
+                  availableWorkflows={repoWorkflows}
+                  suggestedPaymentAmount={suggestedPaymentAmount}
+                  onRefreshWorkers={() => void refreshWorkers()}
+                  onRefreshWallet={() => void refreshWallet()}
+                  onGeneratePaymentToken={() => void generatePaymentToken()}
+                  onConfirmAutoTokenGeneration={() => void confirmAutoTokenGeneration()}
+                  onDismissAutoTokenGeneration={dismissAutoTokenGeneration}
+                  onAddRerunSecret={addRerunSecret}
+                  onRemoveRerunSecret={removeRerunSecret}
+                  onSetRerunCommandMode={mode => {
+                    rerunCommandMode = mode
+                    if (mode === 'reuse') {
+                      runnerScriptAutoManaged = false
+                    } else if (rerunDraft) {
+                      runnerScriptAutoManaged = true
+                      runnerScriptTemplate = buildRunnerScriptTemplate(rerunDraft.workflowPath, selectedWorker, rerunDraft.branch)
+                    }
+                  }}
+                  onRegenerateTemplate={() => {
+                    if (!rerunDraft) return
                     runnerScriptAutoManaged = true
                     runnerScriptTemplate = buildRunnerScriptTemplate(rerunDraft.workflowPath, selectedWorker, rerunDraft.branch)
-                  }
-                }}
-                onRegenerateTemplate={() => {
-                  if (!rerunDraft) return
-                  runnerScriptAutoManaged = true
-                  runnerScriptTemplate = buildRunnerScriptTemplate(rerunDraft.workflowPath, selectedWorker, rerunDraft.branch)
-                }}
-                onSubmit={() => void submitRerunRequest()}
-              />
+                  }}
+                  onSubmit={() => void submitRerunRequest()}
+                />
+              </div>
             {/if}
 
-            <div class="grid gap-3 sm:grid-cols-2">
-              <div class="rounded-md border border-border p-3">
-                <div class="flex items-center justify-between gap-2 text-xs text-muted-foreground">
-                  <span>Run ID</span>
-                  <button class="inline-flex items-center gap-1 rounded px-1.5 py-1 hover:bg-accent" onclick={() => void copyText(run.id, 'Run ID')}>
-                    <Copy class="h-3.5 w-3.5" />
-                    Copy
-                  </button>
-                </div>
-                <div class="mt-1 break-all font-mono text-sm">{run.id}</div>
-              </div>
-              <div class="rounded-md border border-border p-3">
-                <div class="flex items-center justify-between gap-2 text-xs text-muted-foreground">
-                  <span>Commit</span>
-                  {#if run.commit}
-                    <button class="inline-flex items-center gap-1 rounded px-1.5 py-1 hover:bg-accent" onclick={() => void copyText(run.commit, 'Commit')}>
-                      <Copy class="h-3.5 w-3.5" />
-                      Copy
-                    </button>
+            <!-- Main 2-col: content + right sidebar -->
+            <div class="grid gap-4 lg:grid-cols-[minmax(0,1fr)_280px]">
+              <!-- Main content -->
+              <div class="min-w-0 space-y-4">
+                {#if currentDetailView === 'hiveci'}
+                  <WorkflowJobs workflowJobs={workflowJobs} {jobGroups} loading={workflowJobsLoading} error={workflowJobsError} {actJobByName} />
+
+                  {#if parsedActJobs.length > 0}
+                    <WorkflowLogs parsedActJobs={parsedActJobs} {jobGroups} {runFinished} />
+                  {/if}
+
+                  {#if actLogError}
+                    <div class="rounded-md border border-yellow-500/20 bg-yellow-500/10 p-3 text-xs text-yellow-200">{actLogError}</div>
+                  {/if}
+
+                  <ConsoleOutput title="Workflow act log" content={actLogContent} url={eventTagValue(run.workflowLogEvent, 'log_url') || null} defaultLines={3} />
+                {:else}
+                  <div class="grid gap-3 lg:grid-cols-2">
+                    <ConsoleOutput title="stdout (loom)" content={loomStdout} url={loomStdoutUrl} defaultLines={3} />
+                    <ConsoleOutput title="stderr (loom)" content={loomStderr} url={loomStderrUrl} defaultLines={3} variant="error" />
+                  </div>
+                {/if}
+
+                <div class="rounded-md border border-border p-3">
+                  <div class="mb-2 flex items-center justify-between">
+                    <div class="text-sm font-medium">Raw {currentDetailView === 'hiveci' ? 'Hive CI' : 'Loom'} events</div>
+                    <button class="text-xs text-primary hover:underline" onclick={() => (showRawEvents = !showRawEvents)}>{showRawEvents ? 'Hide' : 'Show'}</button>
+                  </div>
+                  {#if showRawEvents}
+                    <div class="space-y-3">
+                      {#each (currentDetailView === 'hiveci' ? hiveciEvents : loomEvents) as block (block.label)}
+                        <div class="rounded-md border border-border p-3">
+                          <div class="flex items-center justify-between gap-3">
+                            <div class="text-sm font-medium">{block.label}</div>
+                            {#if block.event}
+                              <div class="flex items-center gap-2">
+                                <button class="inline-flex items-center gap-1 text-xs text-primary hover:underline" onclick={() => void copyText(block.event?.id, `${block.label} ID`)}>
+                                  <Copy class="h-3 w-3" />
+                                  Copy
+                                </button>
+                                <a class="inline-flex items-center gap-1 text-xs text-primary hover:underline" href={publicLinkForRun(block.event.id)} target="_blank" rel="noreferrer">
+                                  Open
+                                  <ExternalLink class="h-3 w-3" />
+                                </a>
+                              </div>
+                            {/if}
+                          </div>
+                          <div class="mt-2 text-xs text-muted-foreground">{eventSummary(block.event)}</div>
+                          {#if block.event}
+                            <div class="mt-2 break-all font-mono text-xs">{block.event.id}</div>
+                            {#if eventERefs(block.event).length > 0}
+                              <div class="mt-2 text-xs text-muted-foreground">refs: {eventERefs(block.event).join(', ')}</div>
+                            {/if}
+                            {#if externalUrlForEvent(block.event)}
+                              <a class="mt-2 inline-flex items-center gap-1 text-xs text-primary hover:underline" href={externalUrlForEvent(block.event)} target="_blank" rel="noreferrer">
+                                View attached output
+                                <ExternalLink class="h-3 w-3" />
+                              </a>
+                            {/if}
+                          {/if}
+                        </div>
+                      {/each}
+                    </div>
                   {/if}
                 </div>
-                <div class="mt-1 break-all font-mono text-sm">{run.commit || '—'}</div>
               </div>
-              <div class="rounded-md border border-border p-3">
-                <div class="text-xs text-muted-foreground">Branch</div>
-                <div class="mt-1 text-sm">{run.branch}</div>
-              </div>
-              <div class="rounded-md border border-border p-3">
-                <div class="flex items-center justify-between gap-2 text-xs text-muted-foreground">
-                  <span>Triggered by</span>
-                  <button class="inline-flex items-center gap-1 rounded px-1.5 py-1 hover:bg-accent" onclick={() => void copyText(run.actor, 'Actor')}>
-                    <Copy class="h-3.5 w-3.5" />
-                    Copy
-                  </button>
-                </div>
-                <div class="mt-1 break-all font-mono text-sm">{run.actor}</div>
-              </div>
-              <div class="rounded-md border border-border p-3">
-                <div class="text-xs text-muted-foreground">Created</div>
-                <div class="mt-1 text-sm">{formatTimeAgo(run.createdAt)}</div>
-              </div>
-              <div class="rounded-md border border-border p-3">
-                <div class="text-xs text-muted-foreground">Duration</div>
-                <div class="mt-1 text-sm">{isActiveRunStatus(run.status) && liveDurationSeconds !== null ? formatDuration(liveDurationSeconds) : formatDuration(run.duration)}</div>
-              </div>
-            </div>
 
-            {#if selectedRunDetail.worker}
-              <div class="rounded-md border border-border p-3">
-                <div class="mb-2 flex items-center justify-between gap-2 text-sm font-medium">
-                  <div class="flex items-center gap-2">
-                    <Server class="h-4 w-4 text-primary" />
-                    Worker
-                  </div>
-                  <div class="flex items-center gap-2">
-                    <button class="inline-flex items-center gap-1 rounded px-1.5 py-1 text-xs hover:bg-accent" onclick={() => void copyText(selectedRunDetail.worker?.pubkey, 'Worker pubkey')}>
-                      <Copy class="h-3.5 w-3.5" />
-                      Copy
-                    </button>
-                    <a class="inline-flex items-center gap-1 rounded px-1.5 py-1 text-xs hover:bg-accent" href={`nostr:${selectedRunDetail.worker.pubkey}`} target="_blank" rel="noreferrer">
-                      <ExternalLink class="h-3.5 w-3.5" />
-                      Open
-                    </a>
-                  </div>
-                </div>
-                <div class="text-sm">{selectedRunDetail.worker.name}</div>
-                <div class="mt-1 break-all text-xs text-muted-foreground">{selectedRunDetail.worker.pubkey}</div>
-                <div class="mt-2 flex flex-wrap gap-2 text-xs text-muted-foreground">
-                  {#if selectedRunDetail.worker.architecture}<span>{selectedRunDetail.worker.architecture}</span>{/if}
-                  {#if selectedRunDetail.worker.actVersion}<span>act {selectedRunDetail.worker.actVersion}</span>{/if}
-                  {#if selectedRunDetail.worker.pricing?.perSecondRate}<span>{selectedRunDetail.worker.pricing.perSecondRate} {selectedRunDetail.worker.pricing.unit || 'sat'}/s</span>{/if}
-                  <span>{selectedRunDetail.worker.online ? 'online' : 'offline'}</span>
-                </div>
-              </div>
-            {/if}
-
-            <div class="grid gap-3 sm:grid-cols-3">
-              <div class="rounded-md border border-border p-3">
-                <div class="text-xs text-muted-foreground">Prepaid</div>
-                <div class="mt-1 text-lg font-semibold">{prepaidAmount !== null ? `${prepaidAmount.toLocaleString()} sats` : '—'}</div>
-              </div>
-              <div class="rounded-md border border-border p-3">
-                <div class="text-xs text-muted-foreground">Change</div>
-                <div class="mt-1 text-lg font-semibold">{changeAmount !== null ? `${changeAmount.toLocaleString()} sats` : '—'}</div>
-              </div>
-              <div class="rounded-md border border-border p-3">
-                <div class="text-xs text-muted-foreground">Actual cost</div>
-                <div class="mt-1 text-lg font-semibold">{actualCost !== null ? `${actualCost.toLocaleString()} sats` : '—'}</div>
-              </div>
-            </div>
-
-            <WorkflowJobs workflowJobs={workflowJobs} {jobGroups} loading={workflowJobsLoading} error={workflowJobsError} {actJobByName} />
-
-            {#if parsedActJobs.length > 0}
-              <WorkflowLogs parsedActJobs={parsedActJobs} {jobGroups} {runFinished} />
-            {/if}
-
-            {#if actLogError}
-              <div class="rounded-md border border-yellow-500/20 bg-yellow-500/10 p-3 text-xs text-yellow-200">{actLogError}</div>
-            {/if}
-
-            <div class="grid gap-3 lg:grid-cols-2">
-              <ConsoleOutput title="Workflow act log" content={actLogContent} url={eventTagValue(run.workflowLogEvent, 'log_url') || null} defaultLines={3} />
-              <ConsoleOutput title="stdout (loom)" content={loomStdout} url={loomStdoutUrl} defaultLines={3} />
-              <ConsoleOutput title="stderr (loom)" content={loomStderr} url={loomStderrUrl} defaultLines={3} variant="error" />
-            </div>
-
-            <div class="rounded-md border border-border p-3">
-              <div class="mb-2 flex items-center justify-between">
-                <div class="text-sm font-medium">Raw event chain</div>
-                <button class="text-xs text-primary hover:underline" onclick={() => (showRawEvents = !showRawEvents)}>{showRawEvents ? 'Hide' : 'Show'}</button>
-              </div>
-              {#if showRawEvents}
-                <div class="space-y-3">
-                  {#each [
-                    {label: 'Workflow run', event: run.runEvent},
-                    {label: 'Workflow result', event: run.workflowLogEvent},
-                    {label: 'Loom job', event: run.loomJobEvent},
-                    {label: 'Loom status', event: run.loomStatusEvent},
-                    {label: 'Loom result', event: run.loomResultEvent},
-                  ] as block (block.label)}
-                    <div class="rounded-md border border-border p-3">
-                      <div class="flex items-center justify-between gap-3">
-                        <div class="text-sm font-medium">{block.label}</div>
-                        {#if block.event}
-                          <div class="flex items-center gap-2">
-                            <button class="inline-flex items-center gap-1 text-xs text-primary hover:underline" onclick={() => void copyText(block.event?.id, `${block.label} ID`)}>
-                              <Copy class="h-3 w-3" />
-                              Copy
-                            </button>
-                            <a class="inline-flex items-center gap-1 text-xs text-primary hover:underline" href={publicLinkForRun(block.event.id)} target="_blank" rel="noreferrer">
-                              Open
-                              <ExternalLink class="h-3 w-3" />
-                            </a>
-                          </div>
-                        {/if}
-                      </div>
-                      <div class="mt-2 text-xs text-muted-foreground">{eventSummary(block.event)}</div>
-                      {#if block.event}
-                        <div class="mt-2 break-all font-mono text-xs">{block.event.id}</div>
-                        {#if eventERefs(block.event).length > 0}
-                          <div class="mt-2 text-xs text-muted-foreground">refs: {eventERefs(block.event).join(', ')}</div>
-                        {/if}
-                        {#if externalUrlForEvent(block.event)}
-                          <a class="mt-2 inline-flex items-center gap-1 text-xs text-primary hover:underline" href={externalUrlForEvent(block.event)} target="_blank" rel="noreferrer">
-                            View attached output
-                            <ExternalLink class="h-3 w-3" />
-                          </a>
-                        {/if}
-                      {/if}
-                    </div>
-                  {/each}
-                </div>
-              {/if}
+              <RunDetailSidebar
+                {run}
+                worker={selectedRunDetail.worker}
+                {prepaidAmount}
+                {changeAmount}
+                {actualCost}
+                {copyText} />
             </div>
           </div>
         {:else if rerunDraft}

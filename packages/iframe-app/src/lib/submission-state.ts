@@ -1,4 +1,4 @@
-import { buildRerunDraft } from './pipelines';
+import { buildRerunDraft } from './workflows';
 import { buildRunnerScriptTemplate } from './runner-script';
 import { createNewRunDraft } from './submission';
 import type { RepoContextNormalized, RerunDraft, WorkflowRunDetail } from './types';
