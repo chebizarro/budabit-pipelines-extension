@@ -9,7 +9,6 @@
     Copy,
     ExternalLink,
     FileCheck,
-    Filter,
     GitBranch,
     GitCommit,
     Play,
@@ -52,6 +51,9 @@
   import WorkflowLogs from './lib/components/WorkflowLogs.svelte'
   import ReleaseSigningView from './lib/components/ReleaseSigningView.svelte'
   import UserDisplay from './lib/components/UserDisplay.svelte'
+  import FilterDropdown from './lib/components/FilterDropdown.svelte'
+  import {getProfileContent} from 'applesauce-core/helpers/profile'
+  import {eventStore} from './lib/nostr'
   import {loadRunDetailController} from './lib/controllers'
   import {
     createSubmissionResetState,
@@ -149,9 +151,19 @@
   let changeAmount = $state<number | null>(null)
 
   let searchTerm = $state('')
-  let statusFilter = $state<string>('all')
-  let showFilters = $state(false)
+  let workflowFilter = $state<Set<string>>(new Set())
+  let triggerFilter = $state<Set<string>>(new Set())
+  let statusFilter = $state<Set<string>>(new Set())
+  let branchFilter = $state<Set<string>>(new Set())
+  let actorFilter = $state<Set<string>>(new Set())
+  let showStalePending = $state(false)
   let showRawEvents = $state(false)
+
+  const STALE_PENDING_MS = 72 * 60 * 60 * 1000
+
+  // Bump on every event store insert so profile-name lookups used in the
+  // filtered-runs derivation recompute when a kind-0 loads.
+  let profileTick = $state(0)
 
   let currentView = $state<'pipelines' | 'releases'>('pipelines')
 
@@ -368,9 +380,12 @@
     applySubmissionReset()
   }
 
-  function resetFilters() {
-    statusFilter = 'all'
-    searchTerm = ''
+  function profileNameFor(pubkey: string): string {
+    void profileTick // re-run when new events (incl. profiles) arrive
+    if (!pubkey) return ''
+    const event = eventStore.getReplaceable(0, pubkey)
+    if (!event) return ''
+    return getProfileContent(event)?.display_name || getProfileContent(event)?.name || ''
   }
 
   function addRerunSecret() {
@@ -544,18 +559,102 @@
     return response.text()
   }
 
-  const filteredRuns = $derived.by(() =>
-    workflowRuns.filter(run => {
-      if (searchTerm) {
-        const query = searchTerm.toLowerCase()
-        const fields = [run.name, run.branch, run.commitMessage, run.commit, run.actor, run.workflowPath || '']
-        if (!fields.some(field => field.toLowerCase().includes(query))) return false
-      }
+  function distinct(values: Array<string | undefined>): string[] {
+    const seen = new Set<string>()
+    for (const v of values) if (v) seen.add(v)
+    return [...seen].sort()
+  }
 
-      if (statusFilter !== 'all' && run.status !== statusFilter) return false
-      return true
-    }),
+  function workflowBasename(path: string): string {
+    return path.split('/').pop() || path
+  }
+
+  const workflowOptions = $derived(
+    distinct(workflowRuns.map(r => r.workflowPath)).map(v => ({
+      value: v,
+      label: workflowBasename(v),
+    })),
   )
+  const triggerOptions = $derived(
+    distinct(workflowRuns.map(r => r.event)).map(v => ({value: v, label: v})),
+  )
+  const branchOptions = $derived.by(() => {
+    const branches = distinct(workflowRuns.map(r => r.branch))
+    const sorted = branches.sort((a, b) => {
+      if (a === defaultBranch) return -1
+      if (b === defaultBranch) return 1
+      return a.localeCompare(b)
+    })
+    return sorted.map(v => ({
+      value: v,
+      label: v === defaultBranch ? `${v} (default)` : v,
+    }))
+  })
+  const actorOptions = $derived.by(() => {
+    void profileTick
+    const pubkeys = distinct(workflowRuns.map(r => r.actor))
+    return pubkeys
+      .map(pk => ({value: pk, label: profileNameFor(pk) || `${pk.slice(0, 8)}…`}))
+      .sort((a, b) => a.label.localeCompare(b.label))
+  })
+  const statusOptions: Array<{value: string; label: string}> = [
+    {value: 'success', label: 'Success'},
+    {value: 'failure', label: 'Failure'},
+    {value: 'running', label: 'Running'},
+    {value: 'in_progress', label: 'In progress'},
+    {value: 'queued', label: 'Queued'},
+    {value: 'pending', label: 'Pending'},
+    {value: 'cancelled', label: 'Cancelled'},
+    {value: 'skipped', label: 'Skipped'},
+  ]
+
+  const filteredRuns = $derived.by(() => {
+    void profileTick
+    const now = Date.now()
+    const query = searchTerm.trim().toLowerCase()
+
+    return workflowRuns
+      .filter(run => {
+        if (
+          !showStalePending &&
+          run.status === 'pending' &&
+          now - run.createdAt > STALE_PENDING_MS
+        )
+          return false
+
+        if (workflowFilter.size > 0 && !workflowFilter.has(run.workflowPath || '')) return false
+        if (triggerFilter.size > 0 && !triggerFilter.has(run.event || '')) return false
+        if (statusFilter.size > 0 && !statusFilter.has(run.status)) return false
+        if (branchFilter.size > 0 && !branchFilter.has(run.branch)) return false
+        if (actorFilter.size > 0 && !actorFilter.has(run.actor)) return false
+
+        if (query) {
+          const haystack = [
+            run.name,
+            run.branch,
+            run.commitMessage,
+            run.commit,
+            run.actor,
+            run.workflowPath || '',
+            profileNameFor(run.actor),
+          ]
+            .filter(Boolean)
+            .join(' ')
+            .toLowerCase()
+          if (!haystack.includes(query)) return false
+        }
+
+        return true
+      })
+      .sort((a, b) => b.createdAt - a.createdAt)
+  })
+
+  $effect(() => {
+    const sub = eventStore.insert$.subscribe(event => {
+      if (event.kind === 0) profileTick = (profileTick + 1) % Number.MAX_SAFE_INTEGER
+    })
+    return () => sub.unsubscribe()
+  })
 
   $effect(() => {
     if (!bridge) return
@@ -632,7 +731,7 @@
       rerunDraft = {...rerunDraft, workflowPath: repoWorkflows[0].path}
     }
 
-    if ((!rerunDraft.branch || rerunDraft.branch === 'main') && defaultBranch) {
+    if (!rerunDraft.branch && defaultBranch) {
       rerunDraft = {...rerunDraft, branch: defaultBranch}
     }
   })
@@ -818,80 +917,91 @@
         </div>
       {/if}
     {:else}
-    {#if !selectedRunId}
-    <div class="flex flex-col gap-3 sm:flex-row sm:items-center">
-      <div class="relative flex-1">
-        <input
-          class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground"
-          bind:value={searchTerm}
-          type="text"
-          placeholder="Search runs, commits, branches, or actors…" />
+    {#if !selectedRunId && repoMetadataError}
+      <div class="rounded-lg border border-yellow-500/30 bg-yellow-500/10 px-3 py-2 text-xs text-yellow-300">
+        Repo metadata: {repoMetadataError}
       </div>
-      <div class="flex items-center gap-2">
-        <button class="rounded-md border border-input bg-background px-3 py-2 text-sm hover:bg-accent" onclick={() => (showFilters = !showFilters)}>
-          <Filter class="h-4 w-4" />
-        </button>
-        <button class="inline-flex items-center gap-2 rounded-md border border-input bg-background px-3 py-2 text-sm hover:bg-accent" onclick={openNewRunForm}>
-          <Play class="h-4 w-4" />
-          New run
-        </button>
-      </div>
-    </div>
-    {#if repoMetadataError}
-      <p class="text-xs text-yellow-400">Repo metadata: {repoMetadataError}</p>
-    {/if}
     {/if}
 
     <div class="space-y-4">
       {#if !selectedRunId}
       <section class="space-y-4">
 
-        {#if showFilters}
-          <div class="rounded-lg border border-border bg-card p-4">
-            <div class="grid gap-4 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-end">
-              <div class="space-y-2">
-                <label for="status-filter" class="text-sm font-medium">Status</label>
-                <select id="status-filter" bind:value={statusFilter} class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm text-foreground">
-                  <option value="all">All statuses</option>
-                  <option value="success">Success</option>
-                  <option value="failure">Failure</option>
-                  <option value="running">Running</option>
-                  <option value="queued">Queued</option>
-                  <option value="pending">Pending</option>
-                </select>
-              </div>
-              <button class="rounded-md border border-input px-3 py-2 text-sm hover:bg-accent" onclick={resetFilters}>
-                Reset filters
-              </button>
+        <div class="overflow-hidden rounded-lg border border-border bg-card">
+          <div class="flex flex-wrap items-center gap-3 border-b border-border bg-card/60 px-3 py-2">
+            <button class="inline-flex items-center gap-2 rounded-md border border-green-700 bg-green-600 px-3 py-1.5 text-sm font-medium text-white shadow-sm hover:bg-green-500" onclick={openNewRunForm}>
+              <Play class="h-4 w-4" />
+              New run
+            </button>
+            <input
+              class="min-w-0 flex-1 rounded-md border border-input bg-background px-3 py-1.5 text-sm text-foreground placeholder:text-muted-foreground"
+              bind:value={searchTerm}
+              type="text"
+              placeholder="Search runs, commits, branches, actors…" />
+            <div class="flex items-center gap-1">
+              <FilterDropdown
+                label="Workflow"
+                options={workflowOptions}
+                selected={workflowFilter}
+                onChange={next => (workflowFilter = next)} />
+              <FilterDropdown
+                label="Event"
+                options={triggerOptions}
+                selected={triggerFilter}
+                onChange={next => (triggerFilter = next)} />
+              <FilterDropdown
+                label="Status"
+                options={statusOptions}
+                selected={statusFilter}
+                onChange={next => (statusFilter = next)}>
+                {#snippet extraBottom()}
+                  <label class="flex cursor-pointer items-center gap-2 text-xs text-muted-foreground">
+                    <input type="checkbox" bind:checked={showStalePending} class="filter-check" />
+                    Show stale pending (&gt; 72h)
+                  </label>
+                {/snippet}
+              </FilterDropdown>
+              <FilterDropdown
+                label="Branch"
+                options={branchOptions}
+                selected={branchFilter}
+                onChange={next => (branchFilter = next)} />
+              <FilterDropdown
+                label="Triggered by"
+                options={actorOptions}
+                selected={actorFilter}
+                onChange={next => (actorFilter = next)}>
+                {#snippet row(option)}
+                  <UserDisplay pubkey={option.value} />
+                {/snippet}
+              </FilterDropdown>
             </div>
           </div>
-        {/if}
 
-        {#if loading}
-          <div class="flex items-center justify-center rounded-lg border border-border bg-card py-16">
-            <RotateCw class="h-8 w-8 animate-spin text-muted-foreground" />
-          </div>
-        {:else if error}
-          <div class="flex flex-col items-center justify-center rounded-lg border border-border bg-card py-16 text-center text-muted-foreground">
-            <AlertCircle class="mb-3 h-8 w-8" />
-            <p class="max-w-xl text-sm">{error}</p>
-          </div>
-        {:else if filteredRuns.length === 0}
-          <div class="flex flex-col items-center justify-center rounded-lg border border-border bg-card py-16 text-muted-foreground">
-            <SearchX class="mb-3 h-8 w-8" />
-            <p class="text-sm">No pipeline runs found.</p>
-            {#if repo}
-              <p class="mt-2 max-w-md text-xs">
-                Queried relays: {repo.repoRelays.join(', ') || 'none'}<br/>
-                Repo naddr: {repo.repoNaddr ? repo.repoNaddr.slice(0, 40) + '…' : 'not set'}<br/>
-                Workflows: {repoWorkflows.length} found
-              </p>
-            {:else}
-              <p class="mt-2 text-xs text-yellow-400">Repository context not received from host.</p>
-            {/if}
-          </div>
-        {:else}
-          <div class="overflow-hidden rounded-lg border border-border bg-card">
+          {#if loading}
+            <div class="flex items-center justify-center py-16">
+              <RotateCw class="h-8 w-8 animate-spin text-muted-foreground" />
+            </div>
+          {:else if error}
+            <div class="flex flex-col items-center justify-center py-16 text-center text-muted-foreground">
+              <AlertCircle class="mb-3 h-8 w-8" />
+              <p class="max-w-xl text-sm">{error}</p>
+            </div>
+          {:else if filteredRuns.length === 0}
+            <div class="flex flex-col items-center justify-center py-16 text-muted-foreground">
+              <SearchX class="mb-3 h-8 w-8" />
+              <p class="text-sm">No pipeline runs found.</p>
+              {#if repo}
+                <p class="mt-2 max-w-md text-xs">
+                  Queried relays: {repo.repoRelays.join(', ') || 'none'}<br/>
+                  Repo naddr: {repo.repoNaddr ? repo.repoNaddr.slice(0, 40) + '…' : 'not set'}<br/>
+                  Workflows: {repoWorkflows.length} found
+                </p>
+              {:else}
+                <p class="mt-2 text-xs text-yellow-400">Repository context not received from host.</p>
+              {/if}
+            </div>
+          {:else}
             {#each filteredRuns as run, i (run.id)}
               {@const StatusIcon = getStatusIcon(run.status)}
               <button
@@ -959,8 +1069,8 @@
                 </div>
               </button>
             {/each}
-          </div>
-        {/if}
+          {/if}
+        </div>
 
         <div class="rounded-lg border border-border bg-card p-4">
           <div class="grid grid-cols-2 gap-4 sm:grid-cols-4">
