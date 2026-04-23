@@ -924,7 +924,76 @@
     {/if}
 
     <div class="space-y-4">
-      {#if !selectedRunId}
+      {#if !selectedRunId && rerunDraft}
+      <aside class="space-y-4 rounded-lg border border-border bg-card p-4">
+        <div class="flex items-start justify-between gap-3">
+          <div>
+            <h3 class="text-lg font-semibold">New workflow run</h3>
+            <p class="mt-1 text-sm text-muted-foreground">Create a new Hive CI run using live workflow and branch data from this repo.</p>
+          </div>
+          <button class="rounded-md border border-input px-3 py-1.5 text-sm hover:bg-accent" onclick={applySubmissionReset}>
+            Cancel
+          </button>
+        </div>
+
+        <RunSubmissionForm
+          title="New workflow run"
+          description="Recreated from the original PR flow: workflow selection, worker pricing, wallet-aware mint selection, and generated runner script."
+          {submissionMode}
+          bind:rerunDraft
+          bind:rerunCommandMode
+          bind:rerunArgsText
+          bind:rerunPaymentToken
+          bind:rerunSecrets
+          bind:selectedMint
+          bind:paymentAmount
+          bind:maxDuration
+          bind:runnerScriptTemplate
+          bind:runnerScriptAutoManaged
+          {rerunSubmitting}
+          {discoveredWorkers}
+          {loadingWorkers}
+          {walletAvailable}
+          {walletLoading}
+          {walletError}
+          {walletTotalBalance}
+          {walletBalancesByMint}
+          {visibleMintOptions}
+          {generatingPaymentToken}
+          {autoTokenPromptOpen}
+          {selectedWorker}
+          {compatibleMints}
+          {signerError}
+          {canGenerateSuggestedToken}
+          {availableBranches}
+          {defaultBranch}
+          availableWorkflows={repoWorkflows}
+          suggestedPaymentAmount={suggestedPaymentAmount}
+          onRefreshWorkers={() => void refreshWorkers()}
+          onRefreshWallet={() => void refreshWallet()}
+          onGeneratePaymentToken={() => void generatePaymentToken()}
+          onConfirmAutoTokenGeneration={() => void confirmAutoTokenGeneration()}
+          onDismissAutoTokenGeneration={dismissAutoTokenGeneration}
+          onAddRerunSecret={addRerunSecret}
+          onRemoveRerunSecret={removeRerunSecret}
+          onSetRerunCommandMode={mode => {
+            rerunCommandMode = mode
+            if (mode === 'reuse') {
+              runnerScriptAutoManaged = false
+            } else if (rerunDraft) {
+              runnerScriptAutoManaged = true
+              runnerScriptTemplate = buildRunnerScriptTemplate(rerunDraft.workflowPath, selectedWorker, rerunDraft.branch)
+            }
+          }}
+          onRegenerateTemplate={() => {
+            if (!rerunDraft) return
+            runnerScriptAutoManaged = true
+            runnerScriptTemplate = buildRunnerScriptTemplate(rerunDraft.workflowPath, selectedWorker, rerunDraft.branch)
+          }}
+          onSubmit={() => void submitRerunRequest()}
+        />
+      </aside>
+      {:else if !selectedRunId}
       <section class="space-y-4">
 
         <div class="overflow-hidden rounded-lg border border-border bg-card">
