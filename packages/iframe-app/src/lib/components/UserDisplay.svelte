@@ -7,6 +7,7 @@
     pubkey: string
     size?: 'sm' | 'md'
     showName?: boolean
+    link?: boolean
     class?: string
   }
 
@@ -14,6 +15,7 @@
     pubkey,
     size = 'sm',
     showName = true,
+    link = true,
     class: className = '',
   }: Props = $props()
 
@@ -38,7 +40,7 @@
   const initial = $derived(name.charAt(0).toUpperCase() || '?')
 </script>
 
-<span class={`inline-flex min-w-0 items-center gap-1.5 ${className}`}>
+{#snippet body()}
   {#if picture}
     <img
       src={picture}
@@ -56,4 +58,20 @@
   {#if showName}
     <span class="truncate">{name}</span>
   {/if}
-</span>
+{/snippet}
+
+{#if link && pubkey}
+  <a
+    class={`inline-flex min-w-0 items-center gap-1.5 hover:underline ${className}`}
+    href={`nostr:${pubkey}`}
+    target="_blank"
+    rel="noreferrer"
+    title={name}
+    onclick={event => event.stopPropagation()}>
+    {@render body()}
+  </a>
+{:else}
+  <span class={`inline-flex min-w-0 items-center gap-1.5 ${className}`}>
+    {@render body()}
+  </span>
+{/if}

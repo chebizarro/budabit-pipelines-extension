@@ -104,21 +104,11 @@ function resolveRunStatus(
   loomResultEvent?: NostrEvent
 ): { status: WorkflowStatus; duration?: number } {
   if (workflowLogEvent) {
+    // The workflow log event is the authoritative final workflow-level
+    // outcome from the Hive CI publisher. An individual loom job may have
+    // failed and been retried; trust the workflow event.
     const status = normalizeStatus(eventTagValue(workflowLogEvent, 'status'));
     const duration = Number.parseInt(eventTagValue(workflowLogEvent, 'duration') || '', 10);
-
-    if (loomResultEvent) {
-      const success = eventTagValue(loomResultEvent, 'success');
-      const exitCode = eventTagValue(loomResultEvent, 'exit_code');
-      const loomFailed = success === 'false' || (exitCode !== undefined && exitCode !== '0');
-      if (loomFailed) {
-        return {
-          status: 'failure',
-          duration: Number.isFinite(duration) ? duration : undefined,
-        };
-      }
-    }
-
     return {
       status,
       duration: Number.isFinite(duration) ? duration : undefined,
