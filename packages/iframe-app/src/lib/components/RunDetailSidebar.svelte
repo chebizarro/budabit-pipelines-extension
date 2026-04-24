@@ -1,5 +1,5 @@
 <script lang="ts">
-  import {Copy, ExternalLink, GitBranch, GitCommit, Server} from '@lucide/svelte'
+  import {ChevronDown, Copy, ExternalLink, GitBranch, GitCommit, Server} from '@lucide/svelte'
   import {shortId} from '../presentation'
   import {publicLinkForRun} from '../workflows'
   import type {WorkflowRun, LoomWorker} from '../types'
@@ -10,10 +10,27 @@
     prepaidAmount: number | null
     changeAmount: number | null
     actualCost: number | null
+    prepaymentFee?: number | null
+    changeFee?: number | null
     copyText: (value: string | undefined, label: string) => void | Promise<void>
   }
 
-  const {run, worker, prepaidAmount, changeAmount, actualCost, copyText}: Props = $props()
+  const {
+    run,
+    worker,
+    prepaidAmount,
+    changeAmount,
+    actualCost,
+    prepaymentFee = 0,
+    changeFee = 0,
+    copyText,
+  }: Props = $props()
+
+  const fmt = (n: number | null | undefined, sign: '' | '+' | '−' = '') =>
+    n === null || n === undefined ? '—' : `${sign}₿ ${n.toLocaleString()}`
+
+  const plain = (n: number | null | undefined, sign: '' | '+' | '−' = '') =>
+    n === null || n === undefined ? '—' : `${sign}${n.toLocaleString()}`
 </script>
 
 <aside class="min-w-0">
@@ -60,24 +77,8 @@
       {/if}
     </section>
 
-    <section class="space-y-2 py-3">
-      <div class="text-xs font-semibold text-muted-foreground">Cost</div>
-      <div class="flex items-center justify-between text-xs">
-        <span class="text-muted-foreground">Prepaid</span>
-        <span class="font-mono">{prepaidAmount !== null ? `${prepaidAmount.toLocaleString()} sats` : '—'}</span>
-      </div>
-      <div class="flex items-center justify-between text-xs">
-        <span class="text-muted-foreground">Change</span>
-        <span class="font-mono">{changeAmount !== null ? `${changeAmount.toLocaleString()} sats` : '—'}</span>
-      </div>
-      <div class="flex items-center justify-between border-t border-border pt-2 text-sm">
-        <span class="font-medium">Actual cost</span>
-        <span class="font-mono font-semibold">{actualCost !== null ? `${actualCost.toLocaleString()} sats` : '—'}</span>
-      </div>
-    </section>
-
     {#if worker}
-      <section class="space-y-2 pt-3">
+      <section class="space-y-2 py-3">
         <div class="flex items-center justify-between">
           <div class="flex items-center gap-2 text-xs font-semibold text-muted-foreground">
             <Server class="h-3.5 w-3.5" />
@@ -112,5 +113,40 @@
         </div>
       </section>
     {/if}
+
+    <details class="group pt-3 [&>summary::-webkit-details-marker]:hidden">
+      <summary class="flex cursor-pointer select-none list-none items-center justify-between gap-2">
+        <span class="text-xs font-semibold text-muted-foreground">Total cost</span>
+        <span class="flex items-center gap-2">
+          <span class="font-mono font-semibold">{fmt(actualCost)}</span>
+          <ChevronDown class="h-3.5 w-3.5 text-muted-foreground transition-transform group-open:rotate-180" />
+        </span>
+      </summary>
+
+      <div class="mt-3 space-y-1.5">
+        <div class="flex items-center justify-between text-xs">
+          <span class="text-muted-foreground">Prepayment</span>
+          <span class="font-mono text-red-400">{plain(prepaidAmount, '−')}</span>
+        </div>
+        <div class="flex items-center justify-between pl-3 text-[11px]">
+          <span class="text-muted-foreground/80">Prepayment fees</span>
+          <span class="font-mono text-red-400/80">{plain(prepaymentFee ?? 0, '−')}</span>
+        </div>
+
+        <div class="flex items-center justify-between text-xs">
+          <span class="text-muted-foreground">Change</span>
+          <span class="font-mono text-green-400">{plain(changeAmount, '+')}</span>
+        </div>
+        <div class="flex items-center justify-between pl-3 text-[11px]">
+          <span class="text-muted-foreground/80">Change fees</span>
+          <span class="font-mono text-red-400/80">{plain(changeFee ?? 0, '−')}</span>
+        </div>
+
+        <div class="flex items-center justify-between border-t border-border pt-2 text-sm">
+          <span class="font-medium">Total cost</span>
+          <span class="font-mono font-semibold text-foreground">{fmt(actualCost)}</span>
+        </div>
+      </div>
+    </details>
   </div>
 </aside>

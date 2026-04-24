@@ -1,4 +1,5 @@
 import yaml from 'js-yaml'
+import stripAnsi from 'strip-ansi'
 
 export interface ActStep {
   name: string
@@ -53,49 +54,119 @@ function parseActDuration(text: string): number | undefined {
   return Math.round((minutes * 60 + value) * 1000)
 }
 
+// act prefixes every line with `[Workflow/Job] ` while the job is its
+// owner. Continuation lines (e.g. a multi-line bash body echoed back with
+// its `✅ Success` marker, or cargo/rustup output that spans many lines) do
+// not carry this prefix; they belong to whichever job emitted the most
+// recent prefixed line.
+const CTX_RE = /^\[([^\]\/]+)\/([^\]]+)\]\s(.*)$/
+
 export function parseActLog(log: string): ActJob[] {
   const jobMap = new Map<string, ActJob>()
   const currentStep = new Map<string, ActStep>()
+  // Success / Failure markers that didn't include their `[duration]` on the
+  // same line (common for multi-line script steps). Remember them and attach
+  // the duration when it arrives on a later continuation line.
+  const pendingDuration = new Map<string, ActStep>()
 
-  for (const line of log.split('\n')) {
-    const match = line.match(/^\[([^\]\/]+)\/([^\]]+)\]\s(.*)$/)
-    if (!match) continue
+  let lastJobName: string | null = null
 
-    const jobName = normalizeJobName(match[2] || '')
-    const content = match[3] || ''
+  for (const rawLine of log.split('\n')) {
+    const ctxMatch = rawLine.match(CTX_RE)
+    let jobName: string
+    let rawContent: string
+
+    if (ctxMatch) {
+      jobName = normalizeJobName(ctxMatch[2] || '')
+      rawContent = ctxMatch[3] || ''
+      lastJobName = jobName
+    } else if (lastJobName) {
+      // Continuation of the previous prefixed line — attribute it to the
+      // same job so script bodies + cargo output end up inside the right step.
+      jobName = lastJobName
+      rawContent = rawLine
+    } else {
+      continue
+    }
+
+    // Cheap plain-text view used for marker matching and step naming. Raw
+    // content still goes into `logs[]` so the UI can render ANSI colours.
+    const content = stripAnsi(rawContent)
 
     if (!jobMap.has(jobName)) {
       jobMap.set(jobName, {name: jobName, status: 'pending', steps: []})
     }
-
     const job = jobMap.get(jobName)!
 
+    // Resolve a pending duration before anything else. Duration shows up on a
+    // bare `[197.114404ms]` line; everything else is just echoed script body.
+    const pending = pendingDuration.get(jobName)
+    if (pending && !ctxMatch) {
+      const dur = parseActDuration(content)
+      if (dur !== undefined) {
+        pending.durationMs = dur
+        pendingDuration.delete(jobName)
+        continue
+      }
+      // Still searching for the duration — keep script-body echo out of logs
+      // to avoid duplicating the step body in the log viewer.
+      continue
+    } else if (pending && ctxMatch) {
+      pendingDuration.delete(jobName)
+    }
+
     if (content.includes('⭐ Run ')) {
-      const stepName = content.slice(content.indexOf('⭐ Run ') + '⭐ Run '.length).trim()
+      const afterMarker = content.slice(content.indexOf('⭐ Run ') + '⭐ Run '.length)
+      // Clamp to first line — multi-line script bodies sometimes follow.
+      const stepName = (afterMarker.split('\n')[0] || '').trim()
       const step: ActStep = {name: stepName, status: 'pending', logs: []}
       job.steps.push(step)
       currentStep.set(jobName, step)
-    } else if (/^\s+\| /.test(content)) {
-      currentStep.get(jobName)?.logs.push(content.replace(/^\s+\| /, ''))
-    } else if (content.includes('✅') && content.includes('Success')) {
+      continue
+    }
+
+    if (content.includes('✅') && content.includes('Success')) {
       const step = currentStep.get(jobName)
       if (step) {
         step.status = 'success'
-        step.durationMs = parseActDuration(content)
+        const dur = parseActDuration(content)
+        if (dur !== undefined) step.durationMs = dur
+        else pendingDuration.set(jobName, step)
       }
-    } else if (content.includes('❌') && content.includes('Failure')) {
+      continue
+    }
+
+    if (content.includes('❌') && content.includes('Failure')) {
       const step = currentStep.get(jobName)
       if (step) {
         step.status = 'failure'
-        step.durationMs = parseActDuration(content)
+        const dur = parseActDuration(content)
+        if (dur !== undefined) step.durationMs = dur
+        else pendingDuration.set(jobName, step)
       }
       job.status = 'failure'
-    } else if (content.includes('🏁')) {
+      continue
+    }
+
+    if (content.includes('🏁')) {
       if (content.includes('succeeded')) {
         if (job.status !== 'failure') job.status = 'success'
       } else {
         job.status = 'failure'
       }
+      continue
+    }
+
+    // Everything else that belongs to a running step becomes a log line.
+    // Includes `| stdout` pipes, docker exec markers, `⚙ ::set-env::`,
+    // `☁ git clone ...`, and continuation lines from multi-line scripts.
+    const step = currentStep.get(jobName)
+    if (!step) continue
+
+    if (/^\|\s?/.test(rawContent)) {
+      step.logs.push(rawContent.replace(/^\|\s?/, ''))
+    } else {
+      step.logs.push(rawContent)
     }
   }
 

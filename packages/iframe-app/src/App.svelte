@@ -4,6 +4,7 @@
   import {
     AlertCircle,
     ArrowLeft,
+    ChevronDown,
     Copy,
     ExternalLink,
     FileCheck,
@@ -43,7 +44,6 @@
   import RunSubmissionForm from './lib/components/RunSubmissionForm.svelte'
   import ConsoleOutput from './lib/components/ConsoleOutput.svelte'
   import WorkflowJobs from './lib/components/WorkflowJobs.svelte'
-  import WorkflowLogs from './lib/components/WorkflowLogs.svelte'
   import ReleaseSigningView from './lib/components/ReleaseSigningView.svelte'
   import UserDisplay from './lib/components/UserDisplay.svelte'
   import FilterDropdown from './lib/components/FilterDropdown.svelte'
@@ -110,8 +110,9 @@
   let rerunPaymentToken = $state('')
   let rerunSecrets = $state([{key: '', value: ''}])
   let rerunSubmitting = $state(false)
+  let immediateRerunInFlight = $state(false)
   let rerunCommandMode = $state<'reuse' | 'regenerate'>('reuse')
-  let maxDuration = $state(600)
+  let maxDuration = $state(900)
 
   let discoveredWorkers = $state<LoomWorker[]>([])
   let loadingWorkers = $state(false)
@@ -158,7 +159,6 @@
   let branchFilter = $state<Set<string>>(new Set())
   let actorFilter = $state<Set<string>>(new Set())
   let showStalePending = $state(false)
-  let showRawEvents = $state(false)
 
   const STALE_PENDING_MS = 72 * 60 * 60 * 1000
 
@@ -201,9 +201,6 @@
   const parsedActJobs = $derived(parseActLog(actLogContent))
   const actJobByName = $derived(new Map(parsedActJobs.map(job => [job.name.toLowerCase(), job])))
   const jobGroups = $derived(getJobGroups(workflowJobs))
-  const runFinished = $derived(
-    !!selectedRunDetail && !isActiveRunStatus(selectedRunDetail.run.status),
-  )
   const actualCost = $derived(prepaidAmount !== null ? prepaidAmount - (changeAmount ?? 0) : null)
 
   async function showToast(message: string, type: 'info' | 'success' | 'warning' | 'error' = 'info') {
@@ -243,7 +240,6 @@
     loomStderrUrl = null
     prepaidAmount = null
     changeAmount = null
-    showRawEvents = false
   }
 
   function applyDetailSessionState(nextState: ReturnType<typeof createClosedDetailSessionState>) {
@@ -379,7 +375,7 @@
 
   function applySubmissionReset() {
     applySubmissionState(createSubmissionResetState())
-    maxDuration = 600
+    maxDuration = 900
   }
 
   function applyWalletState(nextState: {
@@ -526,6 +522,21 @@
     }
   }
 
+  // Pick the best-balance mint among the worker-compatible set. Used on the
+  // immediate-rerun path where the form's auto-pick effect never mounts.
+  async function ensureMintPicked(): Promise<boolean> {
+    if (selectedMint && visibleMintOptions.includes(selectedMint)) return true
+    if (!walletAvailable || visibleMintOptions.length === 0) {
+      await refreshWallet()
+    }
+    if (visibleMintOptions.length === 0) return false
+    const best = [...visibleMintOptions].sort(
+      (a, b) => (walletBalancesByMint[b] || 0) - (walletBalancesByMint[a] || 0)
+    )[0]
+    if (best) selectedMint = best
+    return !!selectedMint
+  }
+
   async function generatePaymentToken() {
     if (!bridge) return
 
@@ -571,7 +582,7 @@
     applyDetailSessionState(createClosedDetailSessionState())
     signerError = null
     applySubmissionState(nextState)
-    maxDuration = 600
+    maxDuration = 900
 
     if (repoWorkflows.length > 0 && nextState.rerunDraft.workflowPath === '') {
       rerunDraft = {...nextState.rerunDraft, workflowPath: repoWorkflows[0].path}
@@ -596,11 +607,55 @@
       return
     }
 
+    // Close the detail view so the rerun-setup form takes over the main pane
+    // instead of stacking on top of the existing run detail.
+    applyDetailSessionState(createClosedDetailSessionState())
     signerError = null
     applySubmissionState(nextState)
-    maxDuration = selectedRunDetail.worker?.maxDuration || 600
+    maxDuration = selectedRunDetail.worker?.maxDuration || 900
     void refreshWorkers()
     void refreshWallet()
+  }
+
+  async function rerunImmediately() {
+    if (!repo || !selectedRunDetail) return
+
+    const nextState = prepareRerunSubmissionState({repo, runDetail: selectedRunDetail})
+    if (!nextState) {
+      signerError = 'This run does not include enough loom job metadata to prepare a rerun inside the widget.'
+      return
+    }
+
+    // Capture values that live on selectedRunDetail before closing the
+    // detail session (which nulls it out).
+    const previousMaxDuration = selectedRunDetail.worker?.maxDuration || 900
+
+    // Seed the rerun draft + payment state from the previous run, then submit
+    // without rendering the form. The in-flight flag suppresses the form view
+    // during the async token-generation and submit phases, so the user only
+    // sees a lightweight "submitting" placeholder until the new run's detail
+    // page takes over (via applyDetailSessionState inside submitRerunRequest).
+    immediateRerunInFlight = true
+    applyDetailSessionState(createClosedDetailSessionState())
+    signerError = null
+    applySubmissionState(nextState)
+    maxDuration = previousMaxDuration
+    void refreshWorkers()
+
+    try {
+      // The form's auto-pick effect never mounts on this path, so seed the
+      // mint choice here before submitting. Only bails if the wallet has no
+      // overlapping mint at all — otherwise any populated mint works.
+      const hasMint = await ensureMintPicked()
+      if (!hasMint) {
+        applySubmissionReset()
+        void showToast('No compatible mint available for this worker. Add a wallet balance on a mint the worker accepts, then try again.', 'error')
+        return
+      }
+      await submitRerunRequest()
+    } finally {
+      immediateRerunInFlight = false
+    }
   }
 
   async function submitRerunRequest() {
@@ -611,6 +666,15 @@
 
     if (!bridge || !repo || !rerunDraft) {
       signerError = 'Missing required context to submit run. Please try refreshing the page.'
+      return
+    }
+
+    // Every run consumes a fresh single-use Cashu token. The token UI was
+    // removed from the form; we always mint a new one at submit time. The
+    // wallet bridge surfaces its own confirmation dialog before spending.
+    await generatePaymentToken()
+    if (!rerunPaymentToken.trim()) {
+      // generatePaymentToken already surfaced an error + toast.
       return
     }
 
@@ -1052,16 +1116,28 @@
     {/if}
 
     <div class="space-y-4">
-      {#if !selectedRunId && rerunDraft}
-      <aside class="space-y-4 rounded-lg border border-border bg-card p-4">
-        <div class="flex items-start justify-between gap-3">
-          <div>
-            <h3 class="text-lg font-semibold">New workflow run</h3>
-            <p class="mt-1 text-sm text-muted-foreground">Create a new Hive CI run using live workflow and branch data from this repo.</p>
-          </div>
-          <button class="rounded-md border border-input px-3 py-1.5 text-sm hover:bg-accent" onclick={applySubmissionReset}>
-            Cancel
+      {#if immediateRerunInFlight}
+      <div class="flex items-center gap-3 rounded-lg border border-border bg-card px-4 py-3 text-sm text-muted-foreground">
+        <RotateCw class="h-4 w-4 animate-spin text-sky-300" />
+        <span>Submitting re-run…</span>
+      </div>
+      {:else if !selectedRunId && rerunDraft}
+      <div class="space-y-4">
+        <!-- Top bar (matches detail-view shape) -->
+        <div class="flex items-start gap-3">
+          <button class="rounded-md p-1.5 text-muted-foreground hover:bg-accent hover:text-foreground" onclick={applySubmissionReset} title="Back to runs">
+            <ArrowLeft class="h-5 w-5" />
           </button>
+          <div class="min-w-0 flex-1">
+            <h1 class="min-w-0 truncate text-2xl font-semibold">
+              {submissionMode === 'new' ? 'New workflow run' : 'Re-run workflow'}
+            </h1>
+            <p class="mt-1 text-sm text-muted-foreground">
+              {submissionMode === 'new'
+                ? 'Create a Hive CI run using live workflow and branch data from this repo.'
+                : 'Submit another run; payment is minted per run.'}
+            </p>
+          </div>
         </div>
 
         <RunSubmissionForm
@@ -1120,7 +1196,7 @@
           }}
           onSubmit={() => void submitRerunRequest()}
         />
-      </aside>
+      </div>
       {:else if !selectedRunId}
       <section class="space-y-4">
 
@@ -1281,7 +1357,7 @@
                 {/if}
               </div>
               <div class="flex shrink-0 items-center gap-2">
-                <SplitButton onPrimary={openRerunForm} disabled={!!rerunDraft}>
+                <SplitButton onPrimary={() => void rerunImmediately()} disabled={!!rerunDraft || rerunSubmitting}>
                   {#snippet primary()}
                     <Play class="h-4 w-4" />
                     Re-run
@@ -1379,7 +1455,7 @@
               <!-- Main content -->
               <div class="min-w-0 space-y-4">
                 <!-- Metadata strip (same width as content below) -->
-                <div class="grid gap-4 rounded-lg border border-border bg-card p-4 sm:grid-cols-3">
+                <div class="grid gap-4 rounded-lg border border-border bg-card p-4 sm:grid-cols-2 lg:grid-cols-4">
                   <div class="space-y-1">
                     <div class="text-xs text-muted-foreground">{triggerLabel(run.event)}</div>
                     <div class="flex items-center gap-2 text-sm">
@@ -1409,6 +1485,12 @@
                         : formatDuration(run.duration)}
                     </div>
                   </div>
+                  <div class="space-y-1">
+                    <div class="text-xs text-muted-foreground">Total cost</div>
+                    <div class="text-sm font-medium">
+                      {actualCost !== null ? `₿ ${actualCost.toLocaleString()}` : '—'}
+                    </div>
+                  </div>
                 </div>
 
                 {#if usingWorkflowFallback && workflowFallback}
@@ -1433,27 +1515,30 @@
                   </button>
                 {/if}
 
-                {#if parsedActJobs.length > 0}
-                  <WorkflowLogs parsedActJobs={parsedActJobs} {jobGroups} {runFinished} />
-                {/if}
-
                 {#if actLogError}
                   <div class="rounded-md border border-yellow-500/20 bg-yellow-500/10 p-3 text-xs text-yellow-200">{actLogError}</div>
                 {/if}
 
-                <ConsoleOutput title="Workflow act log" content={actLogContent} url={eventTagValue(run.workflowLogEvent, 'log_url') || null} defaultLines={3} />
-
-                <div class="grid gap-3 lg:grid-cols-2">
-                  <ConsoleOutput title="stdout (loom)" content={loomStdout} url={loomStdoutUrl} defaultLines={3} />
-                  <ConsoleOutput title="stderr (loom)" content={loomStderr} url={loomStderrUrl} defaultLines={3} variant="error" />
-                </div>
-
-                <div class="rounded-md border border-border p-3">
-                  <div class="mb-2 flex items-center justify-between">
-                    <div class="text-sm font-medium">Raw event chain</div>
-                    <button class="text-xs text-primary hover:underline" onclick={() => (showRawEvents = !showRawEvents)}>{showRawEvents ? 'Hide' : 'Show'}</button>
+                <details class="group overflow-hidden rounded-md border border-border bg-card [&>summary::-webkit-details-marker]:hidden">
+                  <summary class="flex cursor-pointer select-none list-none items-center justify-between px-4 py-2.5 text-sm font-medium hover:bg-accent/40">
+                    <span>Raw logs</span>
+                    <ChevronDown class="h-4 w-4 text-muted-foreground transition-transform group-open:rotate-180" />
+                  </summary>
+                  <div class="divide-y divide-gray-700 border-t border-border">
+                    <ConsoleOutput embedded title="Workflow act log" content={actLogContent} url={eventTagValue(run.workflowLogEvent, 'log_url') || null} defaultLines={3} />
+                    <div class="grid divide-x divide-gray-700 lg:grid-cols-2">
+                      <ConsoleOutput embedded title="stdout (loom)" content={loomStdout} url={loomStdoutUrl} defaultLines={3} />
+                      <ConsoleOutput embedded title="stderr (loom)" content={loomStderr} url={loomStderrUrl} defaultLines={3} variant="error" />
+                    </div>
                   </div>
-                  {#if showRawEvents}
+                </details>
+
+                <details class="group overflow-hidden rounded-md border border-border bg-card [&>summary::-webkit-details-marker]:hidden">
+                  <summary class="flex cursor-pointer select-none list-none items-center justify-between px-4 py-2.5 text-sm font-medium hover:bg-accent/40">
+                    <span>Raw event chain</span>
+                    <ChevronDown class="h-4 w-4 text-muted-foreground transition-transform group-open:rotate-180" />
+                  </summary>
+                  <div class="border-t border-border p-3">
                     <div class="space-y-3">
                       {#each [...hiveciEvents, ...loomEvents] as block (block.label)}
                         <div class="rounded-md border border-border p-3">
@@ -1488,8 +1573,8 @@
                         </div>
                       {/each}
                     </div>
-                  {/if}
-                </div>
+                  </div>
+                </details>
               </div>
 
               <RunDetailSidebar
