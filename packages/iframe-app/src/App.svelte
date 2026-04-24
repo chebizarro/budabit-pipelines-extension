@@ -4,6 +4,7 @@
   import {
     AlertCircle,
     ArrowLeft,
+    ChevronDown,
     Copy,
     ExternalLink,
     FileCheck,
@@ -43,7 +44,6 @@
   import RunSubmissionForm from './lib/components/RunSubmissionForm.svelte'
   import ConsoleOutput from './lib/components/ConsoleOutput.svelte'
   import WorkflowJobs from './lib/components/WorkflowJobs.svelte'
-  import WorkflowLogs from './lib/components/WorkflowLogs.svelte'
   import ReleaseSigningView from './lib/components/ReleaseSigningView.svelte'
   import UserDisplay from './lib/components/UserDisplay.svelte'
   import FilterDropdown from './lib/components/FilterDropdown.svelte'
@@ -159,7 +159,6 @@
   let branchFilter = $state<Set<string>>(new Set())
   let actorFilter = $state<Set<string>>(new Set())
   let showStalePending = $state(false)
-  let showRawEvents = $state(false)
 
   const STALE_PENDING_MS = 72 * 60 * 60 * 1000
 
@@ -202,9 +201,6 @@
   const parsedActJobs = $derived(parseActLog(actLogContent))
   const actJobByName = $derived(new Map(parsedActJobs.map(job => [job.name.toLowerCase(), job])))
   const jobGroups = $derived(getJobGroups(workflowJobs))
-  const runFinished = $derived(
-    !!selectedRunDetail && !isActiveRunStatus(selectedRunDetail.run.status),
-  )
   const actualCost = $derived(prepaidAmount !== null ? prepaidAmount - (changeAmount ?? 0) : null)
 
   async function showToast(message: string, type: 'info' | 'success' | 'warning' | 'error' = 'info') {
@@ -244,7 +240,6 @@
     loomStderrUrl = null
     prepaidAmount = null
     changeAmount = null
-    showRawEvents = false
   }
 
   function applyDetailSessionState(nextState: ReturnType<typeof createClosedDetailSessionState>) {
@@ -1514,27 +1509,30 @@
                   </button>
                 {/if}
 
-                {#if parsedActJobs.length > 0}
-                  <WorkflowLogs parsedActJobs={parsedActJobs} {jobGroups} {runFinished} />
-                {/if}
-
                 {#if actLogError}
                   <div class="rounded-md border border-yellow-500/20 bg-yellow-500/10 p-3 text-xs text-yellow-200">{actLogError}</div>
                 {/if}
 
-                <ConsoleOutput title="Workflow act log" content={actLogContent} url={eventTagValue(run.workflowLogEvent, 'log_url') || null} defaultLines={3} />
-
-                <div class="grid gap-3 lg:grid-cols-2">
-                  <ConsoleOutput title="stdout (loom)" content={loomStdout} url={loomStdoutUrl} defaultLines={3} />
-                  <ConsoleOutput title="stderr (loom)" content={loomStderr} url={loomStderrUrl} defaultLines={3} variant="error" />
-                </div>
-
-                <div class="rounded-md border border-border p-3">
-                  <div class="mb-2 flex items-center justify-between">
-                    <div class="text-sm font-medium">Raw event chain</div>
-                    <button class="text-xs text-primary hover:underline" onclick={() => (showRawEvents = !showRawEvents)}>{showRawEvents ? 'Hide' : 'Show'}</button>
+                <details class="group overflow-hidden rounded-md border border-border bg-card [&>summary::-webkit-details-marker]:hidden">
+                  <summary class="flex cursor-pointer select-none list-none items-center justify-between px-4 py-2.5 text-sm font-medium hover:bg-accent/40">
+                    <span>Raw logs</span>
+                    <ChevronDown class="h-4 w-4 text-muted-foreground transition-transform group-open:rotate-180" />
+                  </summary>
+                  <div class="divide-y divide-gray-700 border-t border-border">
+                    <ConsoleOutput embedded title="Workflow act log" content={actLogContent} url={eventTagValue(run.workflowLogEvent, 'log_url') || null} defaultLines={3} />
+                    <div class="grid divide-x divide-gray-700 lg:grid-cols-2">
+                      <ConsoleOutput embedded title="stdout (loom)" content={loomStdout} url={loomStdoutUrl} defaultLines={3} />
+                      <ConsoleOutput embedded title="stderr (loom)" content={loomStderr} url={loomStderrUrl} defaultLines={3} variant="error" />
+                    </div>
                   </div>
-                  {#if showRawEvents}
+                </details>
+
+                <details class="group overflow-hidden rounded-md border border-border bg-card [&>summary::-webkit-details-marker]:hidden">
+                  <summary class="flex cursor-pointer select-none list-none items-center justify-between px-4 py-2.5 text-sm font-medium hover:bg-accent/40">
+                    <span>Raw event chain</span>
+                    <ChevronDown class="h-4 w-4 text-muted-foreground transition-transform group-open:rotate-180" />
+                  </summary>
+                  <div class="border-t border-border p-3">
                     <div class="space-y-3">
                       {#each [...hiveciEvents, ...loomEvents] as block (block.label)}
                         <div class="rounded-md border border-border p-3">
@@ -1569,8 +1567,8 @@
                         </div>
                       {/each}
                     </div>
-                  {/if}
-                </div>
+                  </div>
+                </details>
               </div>
 
               <RunDetailSidebar

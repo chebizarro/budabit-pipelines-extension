@@ -7,9 +7,10 @@
     url?: string | null
     defaultLines?: number
     variant?: 'default' | 'error'
+    embedded?: boolean
   }
 
-  let {title, content, url = null, defaultLines = 5, variant = 'default'}: Props = $props()
+  let {title, content, url = null, defaultLines = 5, variant = 'default', embedded = false}: Props = $props()
 
   let expanded = $state(false)
 
@@ -21,7 +22,7 @@
   }
 </script>
 
-<div class="overflow-hidden rounded-lg border {isError ? 'border-red-900/50' : 'border-gray-700'}">
+<div class="overflow-hidden {embedded ? '' : 'rounded-lg border'} {embedded ? '' : (isError ? 'border-red-900/50' : 'border-gray-700')}">
   <div class="flex items-center justify-between {isError ? 'bg-red-950/80' : 'bg-gray-800'} px-4 py-2">
     <h3 class="text-sm font-semibold {isError ? 'text-red-300' : 'text-gray-200'}">{title}</h3>
     <div class="flex items-center gap-2">
