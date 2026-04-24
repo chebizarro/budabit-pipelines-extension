@@ -1,32 +1,36 @@
 <script lang="ts">
-  import {Check, ExternalLink, MoreHorizontal} from '@lucide/svelte'
+  import {ExternalLink, MoreHorizontal} from '@lucide/svelte'
   import type {WorkflowRun, LoomWorker} from '../types'
 
   interface Props {
     run: WorkflowRun
     worker: LoomWorker | null | undefined
-    currentView: 'hiveci' | 'loom'
-    onViewChange: (view: 'hiveci' | 'loom') => void
     onCopyRunId: () => void
     onCopyCommit: () => void
   }
 
-  const {run, worker, currentView, onViewChange, onCopyRunId, onCopyCommit}: Props = $props()
+  const {run, worker, onCopyRunId, onCopyCommit}: Props = $props()
 
   let open = $state(false)
   let button: HTMLButtonElement | undefined = $state()
   let panel: HTMLDivElement | undefined = $state()
 
-  function nostrHref(id: string | undefined) {
-    return id ? `nostr:${id}` : undefined
-  }
+  const HIVE_CI_BASE = 'https://hive-ci.treegaze.com'
+  const LOOM_BASE = 'https://loom.treegaze.com'
 
   const externalLinks = $derived([
-    {label: 'Hive CI run event', href: nostrHref(run.runEvent?.id)},
-    {label: 'Hive CI result event', href: nostrHref(run.workflowLogEvent?.id)},
-    {label: 'Loom job event', href: nostrHref(run.loomJobEvent?.id)},
-    {label: 'Loom result event', href: nostrHref(run.loomResultEvent?.id)},
-    {label: 'Loom worker', href: nostrHref(worker?.pubkey)},
+    {
+      label: 'Hive CI',
+      href: run.runEvent?.id ? `${HIVE_CI_BASE}/run/${run.runEvent.id}` : undefined,
+    },
+    {
+      label: 'Loom (job)',
+      href: run.loomJobEvent?.id ? `${LOOM_BASE}/job/${run.loomJobEvent.id}` : undefined,
+    },
+    {
+      label: 'Loom (worker)',
+      href: worker?.pubkey ? `${LOOM_BASE}/worker/${worker.pubkey}` : undefined,
+    },
   ])
 
   function onDocumentPointerDown(event: PointerEvent) {
@@ -60,23 +64,7 @@
       class="absolute right-0 z-20 mt-2 w-64 rounded-lg border border-border bg-popover text-popover-foreground shadow-lg">
 
       <div class="border-b border-border px-3 py-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-        View
-      </div>
-      <button
-        class="flex w-full items-center justify-between px-3 py-2 text-sm hover:bg-accent"
-        onclick={() => { onViewChange('hiveci'); open = false }}>
-        Hive CI
-        {#if currentView === 'hiveci'}<Check class="h-4 w-4 text-primary" />{/if}
-      </button>
-      <button
-        class="flex w-full items-center justify-between px-3 py-2 text-sm hover:bg-accent"
-        onclick={() => { onViewChange('loom'); open = false }}>
-        Loom
-        {#if currentView === 'loom'}<Check class="h-4 w-4 text-primary" />{/if}
-      </button>
-
-      <div class="border-t border-b border-border px-3 py-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-        Open on Nostr
+        View externally
       </div>
       {#each externalLinks as link (link.label)}
         {#if link.href}

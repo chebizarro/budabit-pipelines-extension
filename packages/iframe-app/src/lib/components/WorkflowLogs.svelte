@@ -101,11 +101,17 @@
 </script>
 
 <div class="rounded-lg border border-border bg-card p-4">
-  <h3 class="mb-4 text-lg font-semibold">Workflow Logs</h3>
-
   {#if jobGroups.length === 0}
-    <p class="text-sm text-muted-foreground">No workflow YAML available for rendering</p>
+    <div class="flex flex-col items-center justify-center gap-2 py-10 text-muted-foreground/60">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" class="h-12 w-12">
+        <rect x="3" y="3" width="18" height="18" rx="2" ry="2" />
+        <circle cx="8.5" cy="8.5" r="1.5" />
+        <path d="M21 15l-5-5L5 21" />
+        <line x1="3" y1="3" x2="21" y2="21" />
+      </svg>
+    </div>
   {:else}
+    <h3 class="mb-4 text-lg font-semibold">Workflow Logs</h3>
     <div class="flex items-start gap-3 overflow-x-auto pb-2">
       {#each jobGroups as group, colIndex (colIndex)}
         <div class="flex flex-col gap-2">

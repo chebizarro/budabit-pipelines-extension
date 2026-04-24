@@ -25,6 +25,7 @@
   import {
     buildAutoTokenCandidateKey,
     formatDuration,
+    formatExactTime,
     formatTimeAgo,
     getStatusBadge,
     getStatusColor,
@@ -49,6 +50,7 @@
   import RunListItem from './lib/components/RunListItem.svelte'
   import RunDetailSidebar from './lib/components/RunDetailSidebar.svelte'
   import RunActionsMenu from './lib/components/RunActionsMenu.svelte'
+  import SplitButton from './lib/components/SplitButton.svelte'
   import {getProfileContent} from 'applesauce-core/helpers/profile'
   import {eventStore} from './lib/nostr'
   import {loadRunDetailController} from './lib/controllers'
@@ -138,6 +140,8 @@
   let workflowJobsLoading = $state(false)
   let workflowJobsError = $state<string | null>(null)
   let workflowJobs = $state<ReturnType<typeof parseWorkflowJobsFromYaml>>([])
+  let workflowFallback = $state<WorkflowDefinition | null>(null)
+  let usingWorkflowFallback = $state(false)
   let actLogContent = $state('')
   let actLogError = $state<string | null>(null)
   let loomStdout = $state('')
@@ -155,7 +159,6 @@
   let actorFilter = $state<Set<string>>(new Set())
   let showStalePending = $state(false)
   let showRawEvents = $state(false)
-  let currentDetailView = $state<'hiveci' | 'loom'>('hiveci')
 
   const STALE_PENDING_MS = 72 * 60 * 60 * 1000
 
@@ -439,6 +442,17 @@
       history.replaceState(null, '', id ? `${baseUrl}${RUN_HASH_PREFIX}${id}` : baseUrl)
     } catch {
       // ignore
+    }
+  }
+
+  function applyWorkflowFallback() {
+    if (!workflowFallback?.content) return
+    try {
+      workflowJobs = parseWorkflowJobsFromYaml(workflowFallback.content)
+      workflowJobsError = null
+      usingWorkflowFallback = true
+    } catch (err) {
+      workflowJobsError = friendlyErrorMessage(err instanceof Error ? err.message : String(err))
     }
   }
 
@@ -944,6 +958,9 @@
       })
     }
 
+    workflowFallback = null
+    usingWorkflowFallback = false
+
     if (run.workflowPath) {
       workflowJobsLoading = true
       const definition = repoWorkflows.find(workflow => workflow.path === run.workflowPath)
@@ -956,6 +973,12 @@
           workflowJobsLoading = false
         }
       } else {
+        const basename = run.workflowPath.split('/').pop() || run.workflowPath
+        const candidate =
+          repoWorkflows.find(w => w.path === run.workflowPath) ||
+          repoWorkflows.find(w => (w.path.split('/').pop() || w.path) === basename) ||
+          null
+        workflowFallback = candidate
         if (repoMetadataLoading) {
           workflowJobsError = 'Waiting for workflow definitions from the host…'
         } else if (repoMetadataError) {
@@ -1119,7 +1142,7 @@
                 selected={workflowFilter}
                 onChange={next => (workflowFilter = next)} />
               <FilterDropdown
-                label="Event"
+                label="Trigger"
                 options={triggerOptions}
                 selected={triggerFilter}
                 onChange={next => (triggerFilter = next)} />
@@ -1258,50 +1281,25 @@
                 {/if}
               </div>
               <div class="flex shrink-0 items-center gap-2">
-                <button class="inline-flex items-center gap-2 rounded-md border border-green-700 bg-green-600 px-3 py-1.5 text-sm font-medium text-white shadow-sm hover:bg-green-500 disabled:opacity-60" onclick={openRerunForm} disabled={!!rerunDraft}>
-                  <Play class="h-4 w-4" />
-                  Re-run all jobs
-                </button>
+                <SplitButton onPrimary={openRerunForm} disabled={!!rerunDraft}>
+                  {#snippet primary()}
+                    <Play class="h-4 w-4" />
+                    Re-run
+                  {/snippet}
+                  {#snippet menu(close: () => void)}
+                    <button
+                      class="flex w-full flex-col items-start gap-0.5 px-3 py-2 text-left text-sm hover:bg-accent"
+                      onclick={() => { openRerunForm(); close() }}>
+                      <span class="font-medium">Re-run with different parameters</span>
+                      <span class="text-xs text-muted-foreground">Edit the worker, branch, or runner script before submitting.</span>
+                    </button>
+                  {/snippet}
+                </SplitButton>
                 <RunActionsMenu
                   {run}
                   worker={selectedRunDetail.worker}
-                  currentView={currentDetailView}
-                  onViewChange={next => (currentDetailView = next)}
                   onCopyRunId={() => void copyText(run.id, 'Run ID')}
                   onCopyCommit={() => void copyText(run.commit, 'Commit')} />
-              </div>
-            </div>
-
-            <!-- Metadata strip -->
-            <div class="grid gap-4 rounded-lg border border-border bg-card p-4 sm:grid-cols-3">
-              <div class="space-y-1">
-                <div class="text-xs text-muted-foreground">{triggerLabel(run.event)}</div>
-                <div class="flex items-center gap-2 text-sm">
-                  {#if run.actor}
-                    <UserDisplay pubkey={run.actor} />
-                  {/if}
-                  <span class="text-muted-foreground">·</span>
-                  <span>{formatTimeAgo(run.createdAt)}</span>
-                </div>
-              </div>
-              <div class="space-y-1">
-                <div class="text-xs text-muted-foreground">Status</div>
-                <span class={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-xs font-medium ${getStatusBadge(run.status)}`}>
-                  {#if run.status === 'running' || run.status === 'in_progress'}
-                    <RotateCw class="h-3.5 w-3.5 animate-spin" />
-                  {:else}
-                    <StatusIcon class="h-3.5 w-3.5" />
-                  {/if}
-                  {statusLabel(run.status)}
-                </span>
-              </div>
-              <div class="space-y-1">
-                <div class="text-xs text-muted-foreground">Total duration</div>
-                <div class="text-sm font-medium">
-                  {isActiveRunStatus(run.status) && liveDurationSeconds !== null
-                    ? formatDuration(liveDurationSeconds)
-                    : formatDuration(run.duration)}
-                </div>
               </div>
             </div>
 
@@ -1380,33 +1378,84 @@
             <div class="grid gap-4 lg:grid-cols-[minmax(0,1fr)_280px]">
               <!-- Main content -->
               <div class="min-w-0 space-y-4">
-                {#if currentDetailView === 'hiveci'}
-                  <WorkflowJobs workflowJobs={workflowJobs} {jobGroups} loading={workflowJobsLoading} error={workflowJobsError} {actJobByName} />
+                <!-- Metadata strip (same width as content below) -->
+                <div class="grid gap-4 rounded-lg border border-border bg-card p-4 sm:grid-cols-3">
+                  <div class="space-y-1">
+                    <div class="text-xs text-muted-foreground">{triggerLabel(run.event)}</div>
+                    <div class="flex items-center gap-2 text-sm">
+                      {#if run.actor}
+                        <UserDisplay pubkey={run.actor} />
+                      {/if}
+                      <span class="text-muted-foreground">·</span>
+                      <span title={formatExactTime(run.createdAt)}>{formatTimeAgo(run.createdAt)}</span>
+                    </div>
+                  </div>
+                  <div class="space-y-1">
+                    <div class="text-xs text-muted-foreground">Status</div>
+                    <span class={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-xs font-medium ${getStatusBadge(run.status)}`}>
+                      {#if run.status === 'running' || run.status === 'in_progress'}
+                        <RotateCw class="h-3.5 w-3.5 animate-spin" />
+                      {:else}
+                        <StatusIcon class="h-3.5 w-3.5" />
+                      {/if}
+                      {statusLabel(run.status)}
+                    </span>
+                  </div>
+                  <div class="space-y-1">
+                    <div class="text-xs text-muted-foreground">Total duration</div>
+                    <div class="text-sm font-medium">
+                      {isActiveRunStatus(run.status) && liveDurationSeconds !== null
+                        ? formatDuration(liveDurationSeconds)
+                        : formatDuration(run.duration)}
+                    </div>
+                  </div>
+                </div>
 
-                  {#if parsedActJobs.length > 0}
-                    <WorkflowLogs parsedActJobs={parsedActJobs} {jobGroups} {runFinished} />
-                  {/if}
-
-                  {#if actLogError}
-                    <div class="rounded-md border border-yellow-500/20 bg-yellow-500/10 p-3 text-xs text-yellow-200">{actLogError}</div>
-                  {/if}
-
-                  <ConsoleOutput title="Workflow act log" content={actLogContent} url={eventTagValue(run.workflowLogEvent, 'log_url') || null} defaultLines={3} />
-                {:else}
-                  <div class="grid gap-3 lg:grid-cols-2">
-                    <ConsoleOutput title="stdout (loom)" content={loomStdout} url={loomStdoutUrl} defaultLines={3} />
-                    <ConsoleOutput title="stderr (loom)" content={loomStderr} url={loomStderrUrl} defaultLines={3} variant="error" />
+                {#if usingWorkflowFallback && workflowFallback}
+                  <div class="rounded-lg border-2 border-yellow-500/40 bg-yellow-500/10 p-4 text-yellow-200">
+                    <div class="flex items-start gap-2 text-sm">
+                      <AlertCircle class="mt-0.5 h-4 w-4 shrink-0" />
+                      <div class="space-y-1">
+                        <div class="font-semibold">Rendering from {workflowFallback.path} on the current branch.</div>
+                        <div class="text-xs text-yellow-200/80">
+                          This run's original workflow file isn't available. The steps, jobs, and structure below reflect the current-branch version and may not match what actually ran.
+                        </div>
+                      </div>
+                    </div>
                   </div>
                 {/if}
+                <WorkflowJobs workflowJobs={workflowJobs} {jobGroups} loading={workflowJobsLoading} error={workflowJobsError} {actJobByName} />
+                {#if workflowJobsError && workflowFallback && !usingWorkflowFallback}
+                  <button
+                    class="inline-flex items-center gap-2 rounded-md border border-yellow-500/30 bg-yellow-500/10 px-3 py-1.5 text-xs font-medium text-yellow-200 hover:bg-yellow-500/20"
+                    onclick={applyWorkflowFallback}>
+                    Try rendering against {workflowFallback.path} from current branch
+                  </button>
+                {/if}
+
+                {#if parsedActJobs.length > 0}
+                  <WorkflowLogs parsedActJobs={parsedActJobs} {jobGroups} {runFinished} />
+                {/if}
+
+                {#if actLogError}
+                  <div class="rounded-md border border-yellow-500/20 bg-yellow-500/10 p-3 text-xs text-yellow-200">{actLogError}</div>
+                {/if}
+
+                <ConsoleOutput title="Workflow act log" content={actLogContent} url={eventTagValue(run.workflowLogEvent, 'log_url') || null} defaultLines={3} />
+
+                <div class="grid gap-3 lg:grid-cols-2">
+                  <ConsoleOutput title="stdout (loom)" content={loomStdout} url={loomStdoutUrl} defaultLines={3} />
+                  <ConsoleOutput title="stderr (loom)" content={loomStderr} url={loomStderrUrl} defaultLines={3} variant="error" />
+                </div>
 
                 <div class="rounded-md border border-border p-3">
                   <div class="mb-2 flex items-center justify-between">
-                    <div class="text-sm font-medium">Raw {currentDetailView === 'hiveci' ? 'Hive CI' : 'Loom'} events</div>
+                    <div class="text-sm font-medium">Raw event chain</div>
                     <button class="text-xs text-primary hover:underline" onclick={() => (showRawEvents = !showRawEvents)}>{showRawEvents ? 'Hide' : 'Show'}</button>
                   </div>
                   {#if showRawEvents}
                     <div class="space-y-3">
-                      {#each (currentDetailView === 'hiveci' ? hiveciEvents : loomEvents) as block (block.label)}
+                      {#each [...hiveciEvents, ...loomEvents] as block (block.label)}
                         <div class="rounded-md border border-border p-3">
                           <div class="flex items-center justify-between gap-3">
                             <div class="text-sm font-medium">{block.label}</div>
