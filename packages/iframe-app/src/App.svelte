@@ -140,6 +140,8 @@
   let workflowJobsLoading = $state(false)
   let workflowJobsError = $state<string | null>(null)
   let workflowJobs = $state<ReturnType<typeof parseWorkflowJobsFromYaml>>([])
+  let workflowFallback = $state<WorkflowDefinition | null>(null)
+  let usingWorkflowFallback = $state(false)
   let actLogContent = $state('')
   let actLogError = $state<string | null>(null)
   let loomStdout = $state('')
@@ -440,6 +442,17 @@
       history.replaceState(null, '', id ? `${baseUrl}${RUN_HASH_PREFIX}${id}` : baseUrl)
     } catch {
       // ignore
+    }
+  }
+
+  function applyWorkflowFallback() {
+    if (!workflowFallback?.content) return
+    try {
+      workflowJobs = parseWorkflowJobsFromYaml(workflowFallback.content)
+      workflowJobsError = null
+      usingWorkflowFallback = true
+    } catch (err) {
+      workflowJobsError = friendlyErrorMessage(err instanceof Error ? err.message : String(err))
     }
   }
 
@@ -945,6 +958,9 @@
       })
     }
 
+    workflowFallback = null
+    usingWorkflowFallback = false
+
     if (run.workflowPath) {
       workflowJobsLoading = true
       const definition = repoWorkflows.find(workflow => workflow.path === run.workflowPath)
@@ -957,6 +973,12 @@
           workflowJobsLoading = false
         }
       } else {
+        const basename = run.workflowPath.split('/').pop() || run.workflowPath
+        const candidate =
+          repoWorkflows.find(w => w.path === run.workflowPath) ||
+          repoWorkflows.find(w => (w.path.split('/').pop() || w.path) === basename) ||
+          null
+        workflowFallback = candidate
         if (repoMetadataLoading) {
           workflowJobsError = 'Waiting for workflow definitions from the host…'
         } else if (repoMetadataError) {
@@ -1389,7 +1411,27 @@
                   </div>
                 </div>
 
+                {#if usingWorkflowFallback && workflowFallback}
+                  <div class="rounded-lg border-2 border-yellow-500/40 bg-yellow-500/10 p-4 text-yellow-200">
+                    <div class="flex items-start gap-2 text-sm">
+                      <AlertCircle class="mt-0.5 h-4 w-4 shrink-0" />
+                      <div class="space-y-1">
+                        <div class="font-semibold">Rendering from {workflowFallback.path} on the current branch.</div>
+                        <div class="text-xs text-yellow-200/80">
+                          This run's original workflow file isn't available. The steps, jobs, and structure below reflect the current-branch version and may not match what actually ran.
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                {/if}
                 <WorkflowJobs workflowJobs={workflowJobs} {jobGroups} loading={workflowJobsLoading} error={workflowJobsError} {actJobByName} />
+                {#if workflowJobsError && workflowFallback && !usingWorkflowFallback}
+                  <button
+                    class="inline-flex items-center gap-2 rounded-md border border-yellow-500/30 bg-yellow-500/10 px-3 py-1.5 text-xs font-medium text-yellow-200 hover:bg-yellow-500/20"
+                    onclick={applyWorkflowFallback}>
+                    Try rendering against {workflowFallback.path} from current branch
+                  </button>
+                {/if}
 
                 {#if parsedActJobs.length > 0}
                   <WorkflowLogs parsedActJobs={parsedActJobs} {jobGroups} {runFinished} />

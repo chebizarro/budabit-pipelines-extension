@@ -59,10 +59,14 @@
     </div>
   </div>
 {:else if error}
-  <div class="rounded-lg border border-border bg-card p-4">
-    <div class="flex items-center gap-2 text-sm text-muted-foreground">
-      <AlertCircle class="h-4 w-4" />
-      <span>{error}</span>
+  <div class="rounded-lg border border-yellow-500/30 bg-yellow-500/10 p-4 text-yellow-200">
+    <div class="flex items-start gap-2 text-sm">
+      <AlertCircle class="mt-0.5 h-4 w-4 shrink-0" />
+      <div class="space-y-1">
+        <div class="font-medium">Workflow jobs unavailable</div>
+        <div class="text-xs text-yellow-200/80">{error}</div>
+        <div class="text-xs text-yellow-200/60">Logs, status, and cost data below are still valid.</div>
+      </div>
     </div>
   </div>
 {:else if jobGroups.length > 0}
