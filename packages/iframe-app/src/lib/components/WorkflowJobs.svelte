@@ -1,6 +1,14 @@
 <script lang="ts">
   import {AlertCircle, Check, ChevronDown, ChevronRight, Circle, Loader2, X} from '@lucide/svelte'
-  import type {ActJob, JobGroup, WorkflowJob} from '../cicd'
+  import Anser from 'anser'
+  import {groupMatrixJobs, type ActJob, type JobGroup, type WorkflowJob} from '../cicd'
+
+  // Render an act log line with cargo/rustup ANSI colours preserved, while
+  // escaping any HTML in the line itself. `use_classes: false` emits inline
+  // styles so we don't need a Tailwind allow-list for the colour palette.
+  function ansiToHtml(line: string): string {
+    return Anser.ansiToHtml(line, {use_classes: false})
+  }
 
   interface Props {
     workflowJobs: WorkflowJob[]
@@ -13,30 +21,85 @@
   let {workflowJobs, jobGroups, loading, error, actJobByName = new Map()}: Props = $props()
 
   let expandedJobId = $state<string | null>(null)
+  let expandedVariantIndex = $state(0)
   let expandedStepIndex = $state<number | null>(null)
 
   function toggleJob(id: string) {
     if (expandedJobId === id) {
       expandedJobId = null
       expandedStepIndex = null
+      expandedVariantIndex = 0
     } else {
       expandedJobId = id
       expandedStepIndex = null
+      expandedVariantIndex = 0
     }
+  }
+
+  // A matrix job's YAML name still carries the `${{ matrix.X }}` placeholder;
+  // act replaces the placeholder with the concrete variant value at runtime
+  // (e.g. `Build .ipk (x86_64)`). Map YAML base → matrix group so we can
+  // resolve a matrix WorkflowJob to all its ActJob variants.
+  const matrixGroups = $derived(groupMatrixJobs(Array.from(actJobByName.values())))
+  const matrixByBaseName = $derived(
+    new Map(matrixGroups.map(group => [group.baseName.toLowerCase(), group])),
+  )
+
+  function yamlJobBaseName(name: string): string {
+    const formatMatch = name.match(/\$\{\{\s*format\(\s*'([^']+)'\s*,/)
+    if (formatMatch) {
+      return (formatMatch[1] || '').replace(/\s*\(\{0\}\)/, '').trim()
+    }
+    // If the placeholder sits inside parens, strip the whole `(...)` group
+    // so `Build .ipk (${{ matrix.X }})` becomes `Build .ipk`. Do this BEFORE
+    // the bare-placeholder strip, or the second regex matches on an already
+    // empty `()` and we end up with a stray trailing `()`.
+    const parensWithPlaceholder = /\s*\([^)]*\$\{\{[^}]*\}\}[^)]*\)/
+    if (parensWithPlaceholder.test(name)) {
+      return name.replace(parensWithPlaceholder, '').trim()
+    }
+    return name.replace(/\s*\$\{\{[^}]*\}\}/, '').trim()
+  }
+
+  function isMatrixJob(job: WorkflowJob): boolean {
+    return job.name.includes('${{')
+  }
+
+  function resolveVariants(job: WorkflowJob): {label: string; actJob: ActJob}[] {
+    if (!isMatrixJob(job)) return []
+    const base = yamlJobBaseName(job.name).toLowerCase()
+    return matrixByBaseName.get(base)?.variants || []
+  }
+
+  function resolveActJob(job: WorkflowJob): ActJob | undefined {
+    if (isMatrixJob(job)) return undefined
+    return actJobByName.get(job.name.toLowerCase()) || actJobByName.get(job.id.toLowerCase())
+  }
+
+  function matrixStatus(variants: {label: string; actJob: ActJob}[]): 'success' | 'failure' | 'pending' | undefined {
+    if (variants.length === 0) return undefined
+    if (variants.some(v => v.actJob.status === 'failure')) return 'failure'
+    if (variants.every(v => v.actJob.status === 'success')) return 'success'
+    return 'pending'
+  }
+
+  function jobStatus(job: WorkflowJob): 'success' | 'failure' | 'pending' | undefined {
+    if (isMatrixJob(job)) return matrixStatus(resolveVariants(job))
+    return resolveActJob(job)?.status
   }
 
   function jobBorderClass(job: WorkflowJob, isExpanded: boolean): string {
     if (isExpanded) return 'border-blue-500 bg-blue-500/10'
-    const actJob = actJobByName.get(job.name.toLowerCase())
-    if (actJob?.status === 'success') return 'border-green-500 bg-green-500/10'
-    if (actJob?.status === 'failure') return 'border-red-500 bg-red-500/10'
+    const status = jobStatus(job)
+    if (status === 'success') return 'border-green-500 bg-green-500/10'
+    if (status === 'failure') return 'border-red-500 bg-red-500/10'
     return 'border-border bg-muted/30 hover:bg-muted/50'
   }
 
   function jobTextClass(job: WorkflowJob): string {
-    const actJob = actJobByName.get(job.name.toLowerCase())
-    if (actJob?.status === 'success') return 'text-green-600 dark:text-green-400'
-    if (actJob?.status === 'failure') return 'text-red-600 dark:text-red-400'
+    const status = jobStatus(job)
+    if (status === 'success') return 'text-green-600 dark:text-green-400'
+    if (status === 'failure') return 'text-red-600 dark:text-red-400'
     return ''
   }
 
@@ -77,17 +140,18 @@
       {#each jobGroups as group, groupIndex (groupIndex)}
         <div class="flex flex-col gap-2">
           {#each group.jobs as job (job.id)}
-            {@const actJob = actJobByName.get(job.name.toLowerCase())}
+            {@const variants = resolveVariants(job)}
+            {@const status = jobStatus(job)}
             {@const isExpanded = expandedJobId === job.id}
             <button
               class="min-w-[160px] rounded-md border-2 px-3 py-2 text-left transition-all hover:shadow-sm {jobBorderClass(job, isExpanded)}"
               onclick={() => toggleJob(job.id)}>
               <div class="flex items-center gap-2">
-                {#if actJob?.status === 'success'}
+                {#if status === 'success'}
                   <Check class="h-3.5 w-3.5 shrink-0 text-green-500" />
-                {:else if actJob?.status === 'failure'}
+                {:else if status === 'failure'}
                   <X class="h-3.5 w-3.5 shrink-0 text-red-500" />
-                {:else if actJob}
+                {:else if status === 'pending'}
                   <Circle class="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
                 {/if}
                 <span class="truncate text-sm font-medium {isExpanded ? '' : jobTextClass(job)}">{job.name}</span>
@@ -95,7 +159,12 @@
               {#if job.runsOn}
                 <div class="mt-0.5 truncate text-xs text-muted-foreground">{job.runsOn}</div>
               {/if}
-              <div class="mt-1 text-xs text-muted-foreground">{job.steps.length} step{job.steps.length !== 1 ? 's' : ''}</div>
+              <div class="mt-1 text-xs text-muted-foreground">
+                {job.steps.length} step{job.steps.length !== 1 ? 's' : ''}
+                {#if variants.length > 0}
+                  · {variants.length} variant{variants.length !== 1 ? 's' : ''}
+                {/if}
+              </div>
             </button>
           {/each}
         </div>
@@ -114,13 +183,17 @@
 
     {#if expandedJobId}
       {@const selectedJob = workflowJobs.find(job => job.id === expandedJobId)}
-      {@const actJob = selectedJob ? actJobByName.get(selectedJob.name.toLowerCase()) : null}
+      {@const variants = selectedJob ? resolveVariants(selectedJob) : []}
+      {@const singleActJob = selectedJob ? resolveActJob(selectedJob) : undefined}
+      {@const activeActJob = variants.length > 0
+        ? variants[Math.min(expandedVariantIndex, variants.length - 1)]?.actJob
+        : singleActJob}
       {#if selectedJob}
         <div class="mt-4 overflow-hidden rounded-md border border-border">
           <div class="flex items-center gap-3 border-b border-border bg-muted/30 px-4 py-2.5">
-            {#if actJob?.status === 'success'}
+            {#if activeActJob?.status === 'success'}
               <Check class="h-4 w-4 text-green-500" />
-            {:else if actJob?.status === 'failure'}
+            {:else if activeActJob?.status === 'failure'}
               <X class="h-4 w-4 text-red-500" />
             {/if}
             <span class="text-sm font-semibold">{selectedJob.name}</span>
@@ -129,9 +202,29 @@
             {/if}
           </div>
 
+          {#if variants.length > 0}
+            <div class="flex flex-wrap gap-1 border-b border-border bg-muted/20 px-3 py-2">
+              {#each variants as variant, vi (variant.actJob.name)}
+                {@const vStatus = variant.actJob.status}
+                <button
+                  class="inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1 text-xs transition-colors {expandedVariantIndex === vi ? 'border-blue-500 bg-blue-500/10 text-foreground' : 'border-border bg-background hover:bg-accent/40'}"
+                  onclick={() => (expandedVariantIndex = vi)}>
+                  {#if vStatus === 'success'}
+                    <Check class="h-3 w-3 text-green-500" />
+                  {:else if vStatus === 'failure'}
+                    <X class="h-3 w-3 text-red-500" />
+                  {:else}
+                    <Circle class="h-3 w-3 text-muted-foreground" />
+                  {/if}
+                  <span class="font-mono">{variant.label || variant.actJob.name}</span>
+                </button>
+              {/each}
+            </div>
+          {/if}
+
           <div class="divide-y divide-border">
-            {#if actJob}
-              {#each actJob.steps as step, i (i)}
+            {#if activeActJob}
+              {#each activeActJob.steps as step, i (i)}
                 {@const badgeClass = step.status === 'success'
                   ? 'bg-green-500/20 text-green-600 dark:text-green-400'
                   : step.status === 'failure'
@@ -152,9 +245,9 @@
                     {/if}
                   </button>
                   {#if expandedStepIndex === i && step.logs.length > 0}
-                    <div class="bg-gray-900 px-4 py-3 font-mono text-xs">
+                    <div class="whitespace-pre-wrap break-words bg-gray-900 px-4 py-3 font-mono text-xs text-gray-200">
                       {#each step.logs as logLine}
-                        <div class="text-gray-200">{logLine}</div>
+                        <div>{@html ansiToHtml(logLine)}</div>
                       {/each}
                     </div>
                   {/if}
