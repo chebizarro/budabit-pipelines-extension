@@ -1,6 +1,6 @@
 <script lang="ts">
   import {ChevronRight, Clock, GitBranch, GitCommit, RotateCw} from '@lucide/svelte'
-  import {formatDuration, formatTimeAgo, getStatusBadge, getStatusColor, getStatusIcon, shortId} from '../presentation'
+  import {formatDuration, formatExactTime, formatTimeAgo, getStatusBadge, getStatusColor, getStatusIcon, shortId} from '../presentation'
   import {statusLabel} from '../workflows'
   import UserDisplay from './UserDisplay.svelte'
   import type {WorkflowRun} from '../types'
@@ -64,8 +64,8 @@
     </span>
   </div>
 
-  <div class="hidden shrink-0 flex-col items-end text-xs text-muted-foreground sm:flex">
-    <div class="flex items-center gap-1">
+  <div class="hidden w-24 shrink-0 flex-col items-end text-xs text-muted-foreground sm:flex">
+    <div class="flex items-center gap-1" title={formatExactTime(run.createdAt)}>
       <Clock class="h-3 w-3" />
       <span>{formatTimeAgo(run.createdAt)}</span>
     </div>
@@ -74,7 +74,7 @@
     {/if}
   </div>
 
-  <span class={`hidden shrink-0 items-center rounded-full border px-2 py-0.5 text-xs font-medium md:inline-flex ${getStatusBadge(run.status)}`}>
+  <span class={`hidden w-24 shrink-0 items-center justify-center rounded-full border px-2 py-0.5 text-xs font-medium md:inline-flex ${getStatusBadge(run.status)}`}>
     {statusLabel(run.status)}
   </span>
 

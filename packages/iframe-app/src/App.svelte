@@ -25,6 +25,7 @@
   import {
     buildAutoTokenCandidateKey,
     formatDuration,
+    formatExactTime,
     formatTimeAgo,
     getStatusBadge,
     getStatusColor,
@@ -1119,7 +1120,7 @@
                 selected={workflowFilter}
                 onChange={next => (workflowFilter = next)} />
               <FilterDropdown
-                label="Event"
+                label="Trigger"
                 options={triggerOptions}
                 selected={triggerFilter}
                 onChange={next => (triggerFilter = next)} />
@@ -1281,7 +1282,7 @@
                     <UserDisplay pubkey={run.actor} />
                   {/if}
                   <span class="text-muted-foreground">·</span>
-                  <span>{formatTimeAgo(run.createdAt)}</span>
+                  <span title={formatExactTime(run.createdAt)}>{formatTimeAgo(run.createdAt)}</span>
                 </div>
               </div>
               <div class="space-y-1">
