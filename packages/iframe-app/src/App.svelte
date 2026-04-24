@@ -110,8 +110,9 @@
   let rerunPaymentToken = $state('')
   let rerunSecrets = $state([{key: '', value: ''}])
   let rerunSubmitting = $state(false)
+  let immediateRerunInFlight = $state(false)
   let rerunCommandMode = $state<'reuse' | 'regenerate'>('reuse')
-  let maxDuration = $state(600)
+  let maxDuration = $state(900)
 
   let discoveredWorkers = $state<LoomWorker[]>([])
   let loadingWorkers = $state(false)
@@ -379,7 +380,7 @@
 
   function applySubmissionReset() {
     applySubmissionState(createSubmissionResetState())
-    maxDuration = 600
+    maxDuration = 900
   }
 
   function applyWalletState(nextState: {
@@ -526,6 +527,21 @@
     }
   }
 
+  // Pick the best-balance mint among the worker-compatible set. Used on the
+  // immediate-rerun path where the form's auto-pick effect never mounts.
+  async function ensureMintPicked(): Promise<boolean> {
+    if (selectedMint && visibleMintOptions.includes(selectedMint)) return true
+    if (!walletAvailable || visibleMintOptions.length === 0) {
+      await refreshWallet()
+    }
+    if (visibleMintOptions.length === 0) return false
+    const best = [...visibleMintOptions].sort(
+      (a, b) => (walletBalancesByMint[b] || 0) - (walletBalancesByMint[a] || 0)
+    )[0]
+    if (best) selectedMint = best
+    return !!selectedMint
+  }
+
   async function generatePaymentToken() {
     if (!bridge) return
 
@@ -571,7 +587,7 @@
     applyDetailSessionState(createClosedDetailSessionState())
     signerError = null
     applySubmissionState(nextState)
-    maxDuration = 600
+    maxDuration = 900
 
     if (repoWorkflows.length > 0 && nextState.rerunDraft.workflowPath === '') {
       rerunDraft = {...nextState.rerunDraft, workflowPath: repoWorkflows[0].path}
@@ -596,11 +612,55 @@
       return
     }
 
+    // Close the detail view so the rerun-setup form takes over the main pane
+    // instead of stacking on top of the existing run detail.
+    applyDetailSessionState(createClosedDetailSessionState())
     signerError = null
     applySubmissionState(nextState)
-    maxDuration = selectedRunDetail.worker?.maxDuration || 600
+    maxDuration = selectedRunDetail.worker?.maxDuration || 900
     void refreshWorkers()
     void refreshWallet()
+  }
+
+  async function rerunImmediately() {
+    if (!repo || !selectedRunDetail) return
+
+    const nextState = prepareRerunSubmissionState({repo, runDetail: selectedRunDetail})
+    if (!nextState) {
+      signerError = 'This run does not include enough loom job metadata to prepare a rerun inside the widget.'
+      return
+    }
+
+    // Capture values that live on selectedRunDetail before closing the
+    // detail session (which nulls it out).
+    const previousMaxDuration = selectedRunDetail.worker?.maxDuration || 900
+
+    // Seed the rerun draft + payment state from the previous run, then submit
+    // without rendering the form. The in-flight flag suppresses the form view
+    // during the async token-generation and submit phases, so the user only
+    // sees a lightweight "submitting" placeholder until the new run's detail
+    // page takes over (via applyDetailSessionState inside submitRerunRequest).
+    immediateRerunInFlight = true
+    applyDetailSessionState(createClosedDetailSessionState())
+    signerError = null
+    applySubmissionState(nextState)
+    maxDuration = previousMaxDuration
+    void refreshWorkers()
+
+    try {
+      // The form's auto-pick effect never mounts on this path, so seed the
+      // mint choice here before submitting. Only bails if the wallet has no
+      // overlapping mint at all — otherwise any populated mint works.
+      const hasMint = await ensureMintPicked()
+      if (!hasMint) {
+        applySubmissionReset()
+        void showToast('No compatible mint available for this worker. Add a wallet balance on a mint the worker accepts, then try again.', 'error')
+        return
+      }
+      await submitRerunRequest()
+    } finally {
+      immediateRerunInFlight = false
+    }
   }
 
   async function submitRerunRequest() {
@@ -611,6 +671,15 @@
 
     if (!bridge || !repo || !rerunDraft) {
       signerError = 'Missing required context to submit run. Please try refreshing the page.'
+      return
+    }
+
+    // Every run consumes a fresh single-use Cashu token. The token UI was
+    // removed from the form; we always mint a new one at submit time. The
+    // wallet bridge surfaces its own confirmation dialog before spending.
+    await generatePaymentToken()
+    if (!rerunPaymentToken.trim()) {
+      // generatePaymentToken already surfaced an error + toast.
       return
     }
 
@@ -1052,16 +1121,28 @@
     {/if}
 
     <div class="space-y-4">
-      {#if !selectedRunId && rerunDraft}
-      <aside class="space-y-4 rounded-lg border border-border bg-card p-4">
-        <div class="flex items-start justify-between gap-3">
-          <div>
-            <h3 class="text-lg font-semibold">New workflow run</h3>
-            <p class="mt-1 text-sm text-muted-foreground">Create a new Hive CI run using live workflow and branch data from this repo.</p>
-          </div>
-          <button class="rounded-md border border-input px-3 py-1.5 text-sm hover:bg-accent" onclick={applySubmissionReset}>
-            Cancel
+      {#if immediateRerunInFlight}
+      <div class="flex items-center gap-3 rounded-lg border border-border bg-card px-4 py-3 text-sm text-muted-foreground">
+        <RotateCw class="h-4 w-4 animate-spin text-sky-300" />
+        <span>Submitting re-run…</span>
+      </div>
+      {:else if !selectedRunId && rerunDraft}
+      <div class="space-y-4">
+        <!-- Top bar (matches detail-view shape) -->
+        <div class="flex items-start gap-3">
+          <button class="rounded-md p-1.5 text-muted-foreground hover:bg-accent hover:text-foreground" onclick={applySubmissionReset} title="Back to runs">
+            <ArrowLeft class="h-5 w-5" />
           </button>
+          <div class="min-w-0 flex-1">
+            <h1 class="min-w-0 truncate text-2xl font-semibold">
+              {submissionMode === 'new' ? 'New workflow run' : 'Re-run workflow'}
+            </h1>
+            <p class="mt-1 text-sm text-muted-foreground">
+              {submissionMode === 'new'
+                ? 'Create a Hive CI run using live workflow and branch data from this repo.'
+                : 'Submit another run; payment is minted per run.'}
+            </p>
+          </div>
         </div>
 
         <RunSubmissionForm
@@ -1120,7 +1201,7 @@
           }}
           onSubmit={() => void submitRerunRequest()}
         />
-      </aside>
+      </div>
       {:else if !selectedRunId}
       <section class="space-y-4">
 
@@ -1281,7 +1362,7 @@
                 {/if}
               </div>
               <div class="flex shrink-0 items-center gap-2">
-                <SplitButton onPrimary={openRerunForm} disabled={!!rerunDraft}>
+                <SplitButton onPrimary={() => void rerunImmediately()} disabled={!!rerunDraft || rerunSubmitting}>
                   {#snippet primary()}
                     <Play class="h-4 w-4" />
                     Re-run

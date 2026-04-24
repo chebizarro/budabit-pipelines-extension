@@ -51,7 +51,7 @@ export function createNewRunDraft(repo: RepoContextNormalized): RerunDraft | nul
     workerPubkey: '',
     command: 'bash',
     args: ['-lc', 'echo "Runner script will be injected at submit time"'],
-    envVars: [],
+    envVars: [{ key: '', value: '' }],
     repoNostrUrl: toRepoNostrUrl(repo.repoAddress, publishRelays),
     publishRelays,
   }
