@@ -1455,7 +1455,7 @@
               <!-- Main content -->
               <div class="min-w-0 space-y-4">
                 <!-- Metadata strip (same width as content below) -->
-                <div class="grid gap-4 rounded-lg border border-border bg-card p-4 sm:grid-cols-3">
+                <div class="grid gap-4 rounded-lg border border-border bg-card p-4 sm:grid-cols-2 lg:grid-cols-4">
                   <div class="space-y-1">
                     <div class="text-xs text-muted-foreground">{triggerLabel(run.event)}</div>
                     <div class="flex items-center gap-2 text-sm">
@@ -1483,6 +1483,12 @@
                       {isActiveRunStatus(run.status) && liveDurationSeconds !== null
                         ? formatDuration(liveDurationSeconds)
                         : formatDuration(run.duration)}
+                    </div>
+                  </div>
+                  <div class="space-y-1">
+                    <div class="text-xs text-muted-foreground">Total cost</div>
+                    <div class="text-sm font-medium">
+                      {actualCost !== null ? `₿ ${actualCost.toLocaleString()}` : '—'}
                     </div>
                   </div>
                 </div>
