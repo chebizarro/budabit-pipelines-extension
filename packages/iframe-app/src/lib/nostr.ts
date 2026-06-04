@@ -26,6 +26,7 @@ import {
   KIND_WORKFLOW_RESULT,
   KIND_WORKFLOW_RUN,
   eventTagValue,
+  repoAddressVariants,
 } from './workflows';
 
 /**
@@ -165,7 +166,9 @@ function buildRepoEventGraph(
 ): Observable<NostrEvent> {
   const workflowRunFilter = {
     kinds: [KIND_WORKFLOW_RUN],
-    '#a': [repoAddress],
+    // Match both the 30617 (announcement) and 30618 (repo-state) coordinates —
+    // older runs reference the repo by its state address, newer by announcement.
+    '#a': repoAddressVariants(repoAddress),
     authors,
   };
   console.log('[workflows] workflow-run subscription', {
