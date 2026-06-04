@@ -187,7 +187,7 @@ export async function queryEvents(
 ): Promise<NostrEvent[]> {
   const effectiveRelays = relays.length > 0 ? relays : FALLBACK_RELAYS;
 
-  console.log('[pipelines] queryEvents:', {
+  console.log('[workflows] queryEvents:', {
     filterCount: filters.length,
     relayCount: effectiveRelays.length,
     kinds: filters.map(f => f.kinds),
@@ -196,12 +196,12 @@ export async function queryEvents(
   // Run each filter as its own bridge request (host expects singular `filter`)
   const results = await Promise.all(
     filters.map(async (filter) => {
-      console.log('[pipelines] nostr:query request:', JSON.stringify(filter));
+      console.log('[workflows] nostr:query request:', JSON.stringify(filter));
       const response = await bridge.request('nostr:query', {
         filter,
         relays: effectiveRelays,
       });
-      console.log('[pipelines] nostr:query response:', typeof response, response && typeof response === 'object' ? Object.keys(response) : response);
+      console.log('[workflows] nostr:query response:', typeof response, response && typeof response === 'object' ? Object.keys(response) : response);
 
       if (response && typeof response === 'object' && 'error' in response) {
         throw new Error(
@@ -654,11 +654,12 @@ export function repoEvents$(
   repoAddress: string,
   relays: string[],
   trustedAuthors: string[],
+  viewerPubkey?: string,
 ): Observable<NostrEvent> {
   const existing = repoEventsCache.get(repoAddress);
   if (existing) return existing;
 
-  const shared = buildRepoEvents(repoAddress, relays, trustedAuthors).pipe(
+  const shared = buildRepoEvents(repoAddress, relays, trustedAuthors, viewerPubkey).pipe(
     tap(event => eventStore.add(event as Parameters<typeof eventStore.add>[0])),
     shareReplay({bufferSize: Infinity, refCount: false}),
   );
@@ -673,12 +674,13 @@ export function repoRuns$(
   repoAddress: string,
   relays: string[],
   trustedAuthors: string[],
+  viewerPubkey?: string,
 ): Observable<WorkflowRun[]> {
   const existing = repoRunsCache.get(repoAddress);
   if (existing) return existing;
 
   const subject = new BehaviorSubject<WorkflowRun[]>([]);
-  repoEvents$(repoAddress, relays, trustedAuthors).subscribe(event => {
+  repoEvents$(repoAddress, relays, trustedAuthors, viewerPubkey).subscribe(event => {
     subject.next(mergeEventIntoRuns(subject.value, event, repoAddress));
   });
   repoRunsCache.set(repoAddress, subject);

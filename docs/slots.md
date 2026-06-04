@@ -225,7 +225,7 @@ Use `builtinRoute` to replace a standard repository route with your widget:
 - `pulls` - Pull requests
 - `wiki` - Repository wiki
 - `settings` - Repository settings
-- `actions` - CI/CD workflows
+- `actions` - workflows
 - `projects` - Project boards
 
 ### Complete Repo Tab Example
